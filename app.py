@@ -105,20 +105,21 @@ def guess_company(text):
             return f"{t} {n}"
     return ""
 
-# 各金控官網網域（5880 合庫、2891 中信已確認；其餘請上線後抽查，若搜不到官網結果可在此修正）
+# 各金控 (簡稱, 官網網域, 官網報告書下載頁)。有填『下載頁』的公司會直接從官網頁面抓 PDF 連結；
+# 沒填的公司改用搜尋。5880 合庫、2891 中信網域已確認；其餘請自行抽查，下載頁網址可隨時補上。
 OFFICIAL = {
-    "2880.TW": ("華南金控", "hnfhc.com.tw"),
-    "2881.TW": ("富邦金控", "fubon.com"),
-    "2882.TW": ("國泰金控", "cathayholdings.com"),
-    "2883.TW": ("凱基金控", "kgi.com.tw"),
-    "2884.TW": ("玉山金控", "esunfhc.com"),
-    "2885.TW": ("元大金控", "yuanta.com.tw"),
-    "2886.TW": ("兆豐金控", "megaholding.com"),
-    "2887.TW": ("台新金控", "taishinholdings.com.tw"),
-    "2890.TW": ("永豐金控", "sinopac.com"),
-    "2891.TW": ("中信金控", "ctbcholding.com"),
-    "2892.TW": ("第一金控", "firstholding.com.tw"),
-    "5880.TW": ("合庫金控", "tcfhc.com.tw"),
+    "2880.TW": ("華南金控", "hnfhc.com.tw", "https://esg.hnfhc.com.tw/WebPortalESG/csr/annual.do"),
+    "2881.TW": ("富邦金控", "fubon.com", "https://www.fubon.com/financialholdings/citizenship/downloadlist/downloadlist_report.html"),
+    "2882.TW": ("國泰金控", "cathayholdings.com", "https://www.cathayholdings.com/holdings/esg/reports/reports_download"),
+    "2883.TW": ("凱基金控", "kgi.com", "https://www.kgi.com/zh-tw/esg/download"),
+    "2884.TW": ("玉山金控", "esunfhc.com", "https://www.esunfhc.com/zh-tw/esg/resource-center/report"),
+    "2885.TW": ("元大金控", "yuanta.com", "https://www.yuanta.com/TW/ESG/ESG-Report"),
+    "2886.TW": ("兆豐金控", "megaholdings.com.tw", "https://esg.megaholdings.com.tw/frontend/download"),
+    "2887.TW": ("台新金控", "tsholdings.com.tw", "https://www.tsholdings.com.tw/tsh/responsibility/report/"),
+    "2890.TW": ("永豐金控", "sinopac.com", "https://www.sinopac.com/esg/tw/sustainability-report/"),
+    "2891.TW": ("中信金控", "ctbcholding.com", "https://ir.ctbcholding.com/c/esg_reports"),
+    "2892.TW": ("第一金控", "firstholding.com.tw", "https://csr.firstholding.com.tw/tc/csr_report.html"),
+    "5880.TW": ("合庫金控", "tcfhc.com.tw", "https://esg.tcfhc.com.tw/report-download/"),
 }
 
 def resolve_company(kw):
@@ -148,40 +149,108 @@ def _raw_search(q, n=10):
         hits = d.text(q, region="tw-tzh", max_results=n)
     return [{"title": h.get("title", ""), "url": h.get("href", ""), "snippet": h.get("body", "")} for h in hits]
 
+from html.parser import HTMLParser
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links, self._cur = [], None
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            a = dict(attrs)
+            self._cur = {"href": a.get("href") or "", "title": a.get("title") or "", "text": ""}
+    def handle_data(self, data):
+        if self._cur is not None:
+            self._cur["text"] += data
+    def handle_endtag(self, tag):
+        if tag == "a" and self._cur is not None:
+            self.links.append(self._cur)
+            self._cur = None
+
+def crawl_report_page(url, year):
+    """直接讀企業官網的報告書下載頁，收集頁面上所有 PDF 連結（含藏在 script/JSON 裡的）。"""
+    from urllib.parse import urljoin, urlparse, unquote
+    r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    html = r.text.replace("\\/", "/")
+    first_seg = "/" + urlparse(url).path.strip("/").split("/")[0].lower()
+    p = _LinkParser()
+    p.feed(html)
+    out, seen = [], set()
+
+    def add(raw_href, title_attr="", text=""):
+        href = urljoin(url, raw_href.strip()).split("#")[0]
+        if not urlparse(href).path.lower().endswith(".pdf") or href in seen:
+            return
+        seen.add(href)
+        fname = unquote(href.rsplit("/", 1)[-1].split("?")[0])
+        title = (title_attr or text).replace("下載", "").replace("(開新視窗)", "").replace("(PDF)", "")
+        title = re.sub(r"\s+", " ", title).strip()
+        if len(title) <= 8:  # 「中文版」「English」這類太短的標題，補上檔名才看得出是哪份
+            title = f"{title} {fname}".strip()
+        blob = f"{title} {href}"
+        is_sus = bool(re.search(r"永續|CSR|ESG|sustainab", blob, re.I)) and not re.search(r"TCFD|TNFD|氣候", blob, re.I)
+        english = bool(re.search(r"[_\-]EN(?![A-Za-z])|English|英文", blob, re.I))
+        parent = urlparse(href).path.lower().startswith(first_seg)
+        out.append({"title": title, "url": href, "來源": "官網",
+                    "snippet": ("永續報告書" if is_sus else "其他報告書（氣候/TCFD 等）") + ("｜英文版" if english else "") + "｜來自官網報告書下載頁",
+                    "_sus": is_sus, "_year": str(year) in blob, "_en": english, "_parent": parent})
+
+    for l in p.links:
+        add(l["href"], l["title"], l["text"])
+    for m in re.findall(r'(?:https?:)?//[^\s"\'<>\\)]+?\.pdf|/[^\s"\'<>\\)]+?\.pdf', html, re.I):
+        add(m if not m.startswith("//") else "https:" + m)
+    out.sort(key=lambda h: (not h["_year"], not h["_sus"], h["_en"], not h["_parent"]))
+    return out
+
 def search_reports(keyword, year, n=10):
-    """先鎖定該公司官網網域搜尋；找不到才退回一般搜尋並標示『非官網』。"""
+    """1) 貼網址：直接讀該頁 PDF；2) 有官網下載頁：直接讀；3) 否則用官網網域搜尋；4) 最後才一般搜尋。"""
     from urllib.parse import urlparse
-    t = resolve_company(keyword)
-    topic = f"永續報告書 {year}"
-    out = []
-    if t:
-        short, domain = OFFICIAL[t]
-        for q in (f"site:{domain} {short} {topic} filetype:pdf", f"site:{domain} {short} {topic}"):
-            for h in _raw_search(q, n):
-                if domain in urlparse(h["url"]).netloc:
-                    h["來源"] = "官網"
-                    out.append(h)
-            if out:
-                break
-        if not out:
-            full = short.replace("金控", "金融控股公司")
-            for h in _raw_search(f"{full} {topic} filetype:pdf", n):
-                blob = h["title"] + h["url"] + h["snippet"]
-                if COMPANIES[t][:2] in blob or short in blob:
-                    h["來源"] = "非官網"
-                    out.append(h)
+    kw = keyword.strip()
+    out, t = [], ""
+    if kw.lower().startswith("http"):
+        host = urlparse(kw).netloc
+        t = next((k for k, v in OFFICIAL.items() if v[1] in host), "")
+        out = crawl_report_page(kw, year)
     else:
-        for h in _raw_search(f"{keyword} {topic} filetype:pdf", n):
-            h["來源"] = "非官網"
-            out.append(h)
+        t = resolve_company(kw)
+        if t and OFFICIAL[t][2]:
+            try:
+                out = crawl_report_page(OFFICIAL[t][2], year)
+            except Exception:
+                out = []
+        if not out and t:
+            short, domain, _ = OFFICIAL[t]
+            topic = f"永續報告書 {year}"
+            for q in (f"site:{domain} {short} {topic} filetype:pdf", f"site:{domain} {short} {topic}"):
+                for h in _raw_search(q, n):
+                    if domain in urlparse(h["url"]).netloc:
+                        h["來源"] = "官網"
+                        out.append(h)
+                if out:
+                    break
+            if not out:
+                full = short.replace("金控", "金融控股公司")
+                for h in _raw_search(f"{full} {topic} filetype:pdf", n):
+                    blob = h["title"] + h["url"] + h["snippet"]
+                    if COMPANIES[t][:2] in blob or short in blob:
+                        h["來源"] = "非官網"
+                        out.append(h)
+        elif not t:
+            for h in _raw_search(f"{kw} 永續報告書 {year} filetype:pdf", n):
+                h["來源"] = "非官網"
+                out.append(h)
     seen, uniq = set(), []
     for h in out:
         if h["url"] not in seen:
             seen.add(h["url"])
+            h.pop("_sus", None)
+            h.pop("_year", None)
+            h.pop("_en", None)
+            h.pop("_parent", None)
             h["company"] = f"{t} {COMPANIES[t]}" if t else ""
             uniq.append(h)
-    uniq.sort(key=lambda h: (h["來源"] != "官網", year not in (h["url"] + h["title"]),
-                             not h["url"].lower().endswith(".pdf")))
     return uniq
 
 def load_report(url):
@@ -285,7 +354,7 @@ t1, t2, t3, t4 = st.tabs(["📂 1 取得報告書", "🤖 2 RAG 評分", "📊 3
 # ---------------- Tab1 ----------------
 with t1:
     c1, c2, c3 = st.columns([3, 1, 1])
-    kw = c1.text_input("輸入關鍵字（公司名稱或代碼，例如：玉山金、2884、富邦）")
+    kw = c1.text_input("輸入關鍵字（公司名稱或代碼，如：合庫金、5880）；或直接貼上企業官網的報告書下載頁網址")
     year = c2.selectbox("年度", [str(y) for y in range(datetime.now().year - 1, 2020, -1)])
     c3.write("")
     if c3.button("🔎 搜尋", type="primary") and kw.strip():
@@ -300,7 +369,7 @@ with t1:
                 df["歸屬公司"] = [r.company or guess_company(f"{r.title} {r.url}") for r in df.itertuples()]
                 df = df.drop(columns=["company"])
                 df.insert(0, "選取", False)
-                df.loc[0, "選取"] = bool(df.loc[0, "來源"] == "官網")
+                df.loc[0, "選取"] = bool(df.loc[0, "來源"] == "官網" and year in (df.loc[0, "title"] + df.loc[0, "url"]))
                 if not (df["來源"] == "官網").any():
                     st.warning("沒有找到該公司官網的結果，以下為一般搜尋結果，請自行確認是否為正確報告書。")
                 st.session_state["results"] = df
