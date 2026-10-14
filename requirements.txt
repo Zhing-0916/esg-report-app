@@ -7,3 +7,4 @@ requests
 pypdf
 scikit-learn
 ddgs
+certifi

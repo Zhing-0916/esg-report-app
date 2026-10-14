@@ -43,6 +43,39 @@ RUBRIC = {
                   "keywords": ["議合", "撤資", "碳定價", "煤", "排除", "轉型", "授信政策"]},
 }
 
+# ---------------- 網路請求（放寬 TLS 嚴格檢查） ----------------
+# Python 3.13 預設啟用 VERIFY_X509_STRICT，部分台灣企業官網憑證缺少 Subject Key Identifier 會被拒絕。
+# 這裡只關閉「嚴格格式檢查」，憑證鏈與網域仍然會驗證。
+import ssl
+import certifi
+import urllib3
+from requests.adapters import HTTPAdapter
+
+class _LaxTLSAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+SESSION = requests.Session()
+SESSION.mount("https://", _LaxTLSAdapter())
+
+def http_get(url, **kw):
+    if st.session_state.get("skip_ssl", False):
+        urllib3.disable_warnings()
+        return requests.get(url, verify=False, **kw)
+    try:
+        return SESSION.get(url, **kw)
+    except requests.exceptions.SSLError as e:
+        # 只針對「憑證格式不符(缺少 Subject Key Identifier)」重試；其他憑證錯誤(過期、網域不符等)仍然報錯。
+        if "Subject Key Identifier" not in str(e):
+            raise
+        from urllib.parse import urlparse
+        st.session_state.setdefault("ssl_relaxed", set()).add(urlparse(url).netloc)
+        urllib3.disable_warnings()
+        return requests.get(url, verify=False, **kw)
+
 # ---------------- 文本處理 ----------------
 def extract_pdf(data: bytes) -> str:
     import io
@@ -55,7 +88,10 @@ def chunk_text(text, size=500, overlap=50):
     return [text[i:i + size] for i in range(0, len(text), step) if text[i:i + size].strip()]
 
 def fetch_pdf(url):
-    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    r = http_get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                               "Referer": f"{u.scheme}://{u.netloc}/"})
     r.raise_for_status()
     return r.content
 
@@ -155,59 +191,100 @@ class _LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links, self._cur = [], None
+        self._row, self._head_buf, self._in_head, self._head = None, "", False, ""
     def handle_starttag(self, tag, attrs):
-        if tag == "a":
+        if tag in ("tr", "li") and self._row is None:
+            self._row = {"text": "", "links": []}
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._in_head, self._head_buf = True, ""
+        elif tag == "a":
             a = dict(attrs)
-            self._cur = {"href": a.get("href") or "", "title": a.get("title") or "", "text": ""}
+            self._cur = {"href": a.get("href") or "", "title": a.get("title") or "", "text": "",
+                         "row": "", "head": self._head}
+            if self._row is not None:
+                self._row["links"].append(self._cur)
     def handle_data(self, data):
         if self._cur is not None:
             self._cur["text"] += data
+        if self._row is not None:
+            self._row["text"] += data
+        if self._in_head:
+            self._head_buf += data
     def handle_endtag(self, tag):
         if tag == "a" and self._cur is not None:
             self.links.append(self._cur)
             self._cur = None
+        elif tag in ("tr", "li") and self._row is not None:
+            txt = " ".join(self._row["text"].split())
+            for l in self._row["links"]:
+                l["row"] = txt
+            self._row = None
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6") and self._in_head:
+            self._head = " ".join(self._head_buf.split())
+            self._in_head = False
 
 def crawl_report_page(url, year):
-    """直接讀企業官網的報告書下載頁，收集頁面上所有 PDF 連結（含藏在 script/JSON 裡的）。"""
+    """直接讀企業官網的報告書下載頁，收集 PDF 連結（含藏在 script 裡的、以及非 .pdf 結尾的下載連結）。"""
     from urllib.parse import urljoin, urlparse, unquote
-    r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    r.encoding = "utf-8"
+    r = http_get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                               "Accept-Language": "zh-TW,zh;q=0.9"})
+    r.encoding = r.apparent_encoding or "utf-8"
     html = r.text.replace("\\/", "/")
     first_seg = "/" + urlparse(url).path.strip("/").split("/")[0].lower()
+    roc = int(year) - 1911
+    year_re = re.compile(rf"(?<!\d){year}(?!\d)|(?<!\d){roc}\s*年")
     p = _LinkParser()
     p.feed(html)
     out, seen = [], set()
 
-    def add(raw_href, title_attr="", text=""):
-        href = urljoin(url, raw_href.strip()).split("#")[0]
-        if not urlparse(href).path.lower().endswith(".pdf") or href in seen:
+    def add(raw_href, title_attr="", text="", loose=False, row="", head=""):
+        raw_href = raw_href.strip()
+        if not raw_href or raw_href.lower().startswith(("#", "javascript", "mailto", "tel")):
             return
+        href = urljoin(url, raw_href).split("#")[0]
+        if href in seen:
+            return
+        is_pdf = urlparse(href).path.lower().endswith(".pdf")
+        if not is_pdf:
+            label = f"{title_attr} {text}"
+            if not (loose and re.search(r"download|file|attach|upload|\.do\?|\.aspx?|\.php", href, re.I)
+                    and re.search(r"報告書|report|csr|永續", label, re.I)):
+                return
         seen.add(href)
         fname = unquote(href.rsplit("/", 1)[-1].split("?")[0])
         title = (title_attr or text).replace("下載", "").replace("(開新視窗)", "").replace("(PDF)", "")
         title = re.sub(r"\s+", " ", title).strip()
-        if len(title) <= 8:  # 「中文版」「English」這類太短的標題，補上檔名才看得出是哪份
-            title = f"{title} {fname}".strip()
-        blob = f"{title} {href}"
-        is_sus = bool(re.search(r"永續|CSR|ESG|sustainab", blob, re.I)) and not re.search(r"TCFD|TNFD|氣候", blob, re.I)
+        if len(title) <= 8:
+            title = f"{title} {row[:30]} {fname}".strip()
+        blob = f"{title} {href} {row} {head}"
+        near = f"{title} {href} {row}"
+        is_sus = bool(re.search(r"永續|CSR|ESG|sustainab", blob, re.I)) and not re.search(r"TCFD|TNFD|氣候", near, re.I)
         english = bool(re.search(r"[_\-]EN(?![A-Za-z])|English|英文", blob, re.I))
         parent = urlparse(href).path.lower().startswith(first_seg)
-        out.append({"title": title, "url": href, "來源": "官網",
-                    "snippet": ("永續報告書" if is_sus else "其他報告書（氣候/TCFD 等）") + ("｜英文版" if english else "") + "｜來自官網報告書下載頁",
-                    "_sus": is_sus, "_year": str(year) in blob, "_en": english, "_parent": parent})
+        note = ("永續報告書" if is_sus else "其他報告書（氣候/TCFD 等）") + ("｜英文版" if english else "")
+        note += "｜來自官網報告書下載頁" + ("" if is_pdf else "｜連結非 .pdf 結尾，載入時會驗證是否為 PDF")
+        out.append({"title": title, "url": href, "來源": "官網", "snippet": note,
+                    "_sus": is_sus, "_year": bool(year_re.search(blob)), "_en": english,
+                    "_parent": parent, "_loose": not is_pdf})
 
     for l in p.links:
-        add(l["href"], l["title"], l["text"])
+        add(l["href"], l["title"], l["text"], loose=True, row=l["row"], head=l["head"])
     for m in re.findall(r'(?:https?:)?//[^\s"\'<>\\)]+?\.pdf|/[^\s"\'<>\\)]+?\.pdf', html, re.I):
         add(m if not m.startswith("//") else "https:" + m)
-    out.sort(key=lambda h: (not h["_year"], not h["_sus"], h["_en"], not h["_parent"]))
+    out.sort(key=lambda h: (h["_loose"], not h["_year"], not h["_sus"], h["_en"], not h["_parent"]))
+
+    st.session_state["diag"] = {
+        "頁面網址": url, "HTTP 狀態": r.status_code, "網頁內容長度": len(html),
+        "頁面連結總數": len(p.links), "抓到的候選報告連結數": len(out),
+        "前 15 個連結文字": [(l["text"] or l["title"]).strip()[:25] for l in p.links[:15]],
+    }
     return out
 
 def search_reports(keyword, year, n=10):
     """1) 貼網址：直接讀該頁 PDF；2) 有官網下載頁：直接讀；3) 否則用官網網域搜尋；4) 最後才一般搜尋。"""
     from urllib.parse import urlparse
     kw = keyword.strip()
+    st.session_state["crawl_err"] = None
     out, t = [], ""
     if kw.lower().startswith("http"):
         host = urlparse(kw).netloc
@@ -218,8 +295,9 @@ def search_reports(keyword, year, n=10):
         if t and OFFICIAL[t][2]:
             try:
                 out = crawl_report_page(OFFICIAL[t][2], year)
-            except Exception:
+            except Exception as e:
                 out = []
+                st.session_state["crawl_err"] = f"{type(e).__name__}: {str(e)[:250]}"
         if not out and t:
             short, domain, _ = OFFICIAL[t]
             topic = f"永續報告書 {year}"
@@ -249,6 +327,7 @@ def search_reports(keyword, year, n=10):
             h.pop("_year", None)
             h.pop("_en", None)
             h.pop("_parent", None)
+            h.pop("_loose", None)
             h["company"] = f"{t} {COMPANIES[t]}" if t else ""
             uniq.append(h)
     return uniq
@@ -346,6 +425,8 @@ if st.sidebar.button("🔌 測試 API 連線"):
     except Exception as e:
         st.sidebar.error(f"無法連線：{e}")
 
+st.sidebar.checkbox("略過 SSL 憑證驗證（疑難排解用，預設不要勾）", key="skip_ssl")
+
 st.session_state.setdefault("docs", {})
 
 st.title("🌱 臺灣金融業永續報告書：檢索、評分與比較")
@@ -362,8 +443,17 @@ with t1:
             with st.spinner("搜尋永續報告書中…"):
                 res = search_reports(kw.strip(), year)
             df = pd.DataFrame(res)
+            if st.session_state.get("crawl_err"):
+                st.warning("讀取官網報告書頁面失敗，已改用搜尋結果（可能不準確，請特別確認來源與檔名）："
+                           + st.session_state["crawl_err"])
             if df.empty:
-                st.warning("沒有找到結果，換個關鍵字試試。")
+                st.warning("沒有找到結果。")
+                if st.session_state.get("diag"):
+                    with st.expander("🩺 診斷資訊（回報問題時請截圖這一塊）", expanded=True):
+                        st.json(st.session_state["diag"])
+                        d = st.session_state["diag"]
+                        if d["頁面連結總數"] < 5:
+                            st.info("頁面幾乎沒有連結，可能是網站用 JavaScript 動態載入內容，或是擋掉了雲端主機的存取。")
                 st.session_state.pop("results", None)
             else:
                 df["歸屬公司"] = [r.company or guess_company(f"{r.title} {r.url}") for r in df.itertuples()]
@@ -399,6 +489,9 @@ with t1:
             if st.session_state["docs"]:
                 run_scoring(list(st.session_state["docs"]))
                 st.success("評分完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
+                if st.session_state.get("ssl_relaxed"):
+                    st.info("提醒：以下網站的憑證格式不符規範（缺少 Subject Key Identifier），"
+                            "已改用免憑證驗證下載公開報告書：" + "、".join(sorted(st.session_state["ssl_relaxed"])))
 
     with st.expander("搜尋不到？手動上傳 PDF"):
         ups = st.file_uploader("檔名請含代碼，例如 2884_玉山金.pdf", type="pdf", accept_multiple_files=True)
