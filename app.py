@@ -271,12 +271,28 @@ def crawl_report_page(url, year):
         add(l["href"], l["title"], l["text"], loose=True, row=l["row"], head=l["head"])
     for m in re.findall(r'(?:https?:)?//[^\s"\'<>\\)]+?\.pdf|/[^\s"\'<>\\)]+?\.pdf', html, re.I):
         add(m if not m.startswith("//") else "https:" + m)
+    # 有些網站的清單是 JavaScript 動態載入：改掃同網站的 script 檔，找裡面的 PDF 連結
+    host = urlparse(url).netloc
+    labels = host.split(".")
+    root = ".".join(labels[-3:] if len(labels) >= 3 and labels[-2] in ("com", "org", "net", "gov", "edu") else labels[-2:])
+    script_urls = [urljoin(url, x) for x in re.findall(r'<script[^>]+src=["\']([^"\']+)', html, re.I)]
+    same_site = [x for x in script_urls if urlparse(x).netloc.endswith(root)]
+    if not out:
+        for sj in same_site[:8]:
+            try:
+                body = http_get(sj, timeout=15, headers={"User-Agent": "Mozilla/5.0"}).text.replace("\\/", "/")
+            except Exception:
+                continue
+            for m in re.findall(r'(?:https?:)?//[^\s"\'<>\\)]+?\.pdf|[\w./-]+?\.pdf', body, re.I):
+                add(m if not m.startswith("//") else "https:" + m)
     out.sort(key=lambda h: (h["_loose"], not h["_year"], not h["_sus"], h["_en"], not h["_parent"]))
 
     st.session_state["diag"] = {
         "頁面網址": url, "HTTP 狀態": r.status_code, "網頁內容長度": len(html),
         "頁面連結總數": len(p.links), "抓到的候選報告連結數": len(out),
         "前 15 個連結文字": [(l["text"] or l["title"]).strip()[:25] for l in p.links[:15]],
+        "頁面載入的 script 檔": script_urls[:12],
+        "HTML 開頭片段": " ".join(html[:400].split()),
     }
     return out
 
@@ -289,7 +305,10 @@ def search_reports(keyword, year, n=10):
     if kw.lower().startswith("http"):
         host = urlparse(kw).netloc
         t = next((k for k, v in OFFICIAL.items() if v[1] in host), "")
-        out = crawl_report_page(kw, year)
+        if urlparse(kw).path.lower().endswith(".pdf"):
+            out = [{"title": kw.rsplit("/", 1)[-1], "url": kw, "snippet": "你直接貼上的 PDF 連結", "來源": "官網" if t else "手動貼上"}]
+        else:
+            out = crawl_report_page(kw, year)
     else:
         t = resolve_company(kw)
         if t and OFFICIAL[t][2]:
