@@ -119,10 +119,16 @@ def llm_review(name, dim, evidence, endpoint, token, model):
               "請只回傳 JSON：{\"score\": 0-5 的數字, \"reason\": \"一句話理由\"}\n\n"
               + "\n---\n".join(evidence))
     try:
-        r = requests.post(endpoint, timeout=40,
-                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                          json={"model": model, "temperature": 0,
-                                "messages": [{"role": "user", "content": prompt}]})
+        import time
+        for _ in range(2):
+            r = requests.post(endpoint, timeout=40,
+                              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                              json={"model": model, "temperature": 0,
+                                    "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code == 429:  # 免費額度常見的限流：等幾秒再試一次
+                time.sleep(4)
+                continue
+            break
         r.raise_for_status()
         txt = r.json()["choices"][0]["message"]["content"]
         j = json.loads(re.search(r"\{.*\}", txt, re.S).group())
@@ -430,6 +436,15 @@ use_llm = st.sidebar.checkbox("啟用 LLM 依檢索證據複核評分", value=Fa
 endpoint = st.sidebar.text_input("API Endpoint", secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions"))
 token = st.sidebar.text_input("API Token", secret("CUSTOM_API_TOKEN"), type="password")
 model = st.sidebar.text_input("模型名稱", secret("LLM_MODEL", "gpt-4o-mini"))
+
+if st.sidebar.button("📋 列出此帳號可用的模型"):
+    try:
+        mr = requests.get(endpoint.replace("/chat/completions", "/models"), timeout=20,
+                          headers={"Authorization": f"Bearer {token}"})
+        mr.raise_for_status()
+        st.sidebar.code("\n".join(sorted(m["id"] for m in mr.json().get("data", []))))
+    except Exception as e:
+        st.sidebar.error(f"查詢失敗：{e}")
 
 if st.sidebar.button("🔌 測試 API 連線"):
     try:
