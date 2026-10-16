@@ -434,7 +434,16 @@ overlap = st.sidebar.slider("Overlap 字數", 0, 200, 50)
 st.sidebar.subheader("🔑 LLM 複核（選用）")
 use_llm = st.sidebar.checkbox("啟用 LLM 依檢索證據複核評分", value=False)
 endpoint = st.sidebar.text_input("API Endpoint", secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions"))
-token = st.sidebar.text_input("API Token", secret("CUSTOM_API_TOKEN"), type="password")
+# 安全做法：Secrets 裡的 key 只在伺服器端使用，絕不預填到網頁欄位（否則按「眼睛」圖示就看得到）
+_SECRET_TOKEN = secret("CUSTOM_API_TOKEN")
+_ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，訪客要輸入密碼才能使用你的 key
+_user_token = st.sidebar.text_input("（選填）使用你自己的 API key", "", type="password")
+_allowed = bool(_SECRET_TOKEN)
+if _SECRET_TOKEN and _ACCESS_CODE:
+    _allowed = st.sidebar.text_input("LLM 功能使用密碼", "", type="password") == _ACCESS_CODE
+token = _user_token or (_SECRET_TOKEN if _allowed else "")
+if token and not _user_token:
+    st.sidebar.caption("✅ 已使用網站管理者設定的 API key（不會顯示在網頁上）")
 model = st.sidebar.text_input("模型名稱", secret("LLM_MODEL", "gpt-4o-mini"))
 
 if st.sidebar.button("📋 列出此帳號可用的模型"):
