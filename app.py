@@ -366,12 +366,92 @@ def load_report(url):
         raise ValueError("PDF 幾乎抽不到文字（可能是掃描檔）")
     return text
 
+# ---------------- 報告書資料庫 ----------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LIB_COLS = ["代碼", "年度", "PDF來源", "備註"]
+
+def normalize_url(u):
+    """把 Google Drive / Dropbox 分享連結轉成可直接下載的連結。"""
+    u = str(u).strip()
+    m = re.search(r"drive\.google\.com/file/d/([\w-]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    if "dropbox.com" in u:
+        return u.replace("dl=0", "dl=1") if "dl=" in u else u + ("&" if "?" in u else "?") + "dl=1"
+    return u
+
+def _norm_code(x):
+    m = re.match(r"\d{4}", str(x).strip())
+    return f"{m.group()}.TW" if m else ""
+
+def load_library():
+    """合併 reports_index.csv（連結清單）與 reports/ 資料夾（檔名如 2884_2023.pdf）。"""
+    frames = []
+    p = os.path.join(BASE_DIR, "reports_index.csv")
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, dtype=str, encoding="utf-8-sig").fillna("")
+            df = df.rename(columns={"股票代碼/名稱": "代碼", "股票代碼": "代碼", "代碼名稱": "代碼"})
+            for c in LIB_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            frames.append(df[LIB_COLS])
+        except Exception:
+            pass
+    rd = os.path.join(BASE_DIR, "reports")
+    if os.path.isdir(rd):
+        rows = []
+        for f in sorted(os.listdir(rd)):
+            m = re.match(r"(\d{4})[_\-](\d{4})", f)
+            if f.lower().endswith(".pdf") and m:
+                rows.append({"代碼": m.group(1), "年度": m.group(2), "PDF來源": f, "備註": "本機檔案"})
+        if rows:
+            frames.append(pd.DataFrame(rows, columns=LIB_COLS))
+    if not frames:
+        return pd.DataFrame(columns=LIB_COLS)
+    df = pd.concat(frames, ignore_index=True)
+    df["代碼"] = df["代碼"].map(_norm_code)
+    df["年度"] = df["年度"].astype(str).str.extract(r"(\d{4})")[0]
+    df = df[df["代碼"].isin(COMPANIES) & df["年度"].notna() & (df["PDF來源"].str.strip() != "")]
+    return df.drop_duplicates(["代碼", "年度"], keep="first").reset_index(drop=True)
+
+def check_link(src):
+    """只讀檔頭前幾個位元組，確認連結真的是 PDF（不會下載整份）。"""
+    try:
+        if not str(src).lower().startswith("http"):
+            ok = os.path.exists(os.path.join(BASE_DIR, "reports", src))
+            return "✅ 本機檔案" if ok else "❌ 找不到檔案"
+        from urllib.parse import urlparse
+        u = urlparse(normalize_url(src))
+        r = http_get(normalize_url(src), timeout=20, stream=True,
+                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                              "Referer": f"{u.scheme}://{u.netloc}/"})
+        head = next(r.iter_content(16), b"")
+        status = r.status_code
+        r.close()
+        if status >= 400:
+            return f"❌ HTTP {status}"
+        return "✅ PDF" if head[:4] == b"%PDF" else "⚠️ 不是 PDF（可能是網頁或需登入）"
+    except Exception as e:
+        return f"❌ {type(e).__name__}"
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def get_text(src):
+    """從資料庫取得報告書全文（結果會快取，同一份不會重複下載解析）。"""
+    if str(src).lower().startswith("http"):
+        return load_report(normalize_url(src))
+    with open(os.path.join(BASE_DIR, "reports", src), "rb") as f:
+        text = extract_pdf(f.read())
+    if len(text) < 1000:
+        raise ValueError("PDF 幾乎抽不到文字（可能是掃描檔）")
+    return text
+
 def run_scoring(tickers):
     rows, evidence = [], []
     bar = st.progress(0.0)
     for i, t in enumerate(tickers):
         chunks = chunk_text(st.session_state["docs"][t], chunk_size, overlap)
-        row = {"代碼": t, "公司": COMPANIES[t]}
+        row = {"代碼": t, "公司": COMPANIES[t], "年度": st.session_state.get("lib_year", "")}
         for dim, cfg in RUBRIC.items():
             top = retrieve(chunks, cfg["query"], top_k)
             sc_, hit, best = rule_score(top, cfg["keywords"])
@@ -477,6 +557,40 @@ t1, t2, t3, t4 = st.tabs(["📂 1 取得報告書", "🤖 2 RAG 評分", "📊 3
 
 # ---------------- Tab1 ----------------
 with t1:
+    st.subheader("📚 報告書資料庫（優先使用）")
+    lib = load_library()
+    if lib.empty:
+        st.info("資料庫目前是空的。請用下方「即時搜尋」找到報告書後加入清單，再下載 reports_index.csv 上傳到 GitHub；"
+                "或直接把 PDF 放進 GitHub 的 reports 資料夾（檔名如 2884_2023.pdf）。")
+    else:
+        ly = st.selectbox("年度", sorted(lib["年度"].unique(), reverse=True), key="lib_year_sel")
+        avail = lib[lib["年度"] == ly]
+        names = {r.代碼: f"{r.代碼} {COMPANIES.get(r.代碼, '')}" for r in avail.itertuples()}
+        picks = st.multiselect("選擇公司（同一年度才能公平比較）", list(names), default=list(names),
+                               format_func=lambda x: names[x])
+        if st.button("⚡ 從資料庫載入並評分", type="primary") and picks:
+            st.session_state["docs"] = {}
+            for r in avail[avail["代碼"].isin(picks)].itertuples():
+                try:
+                    with st.spinner(f"載入 {COMPANIES[r.代碼]} {ly} 年報告書…"):
+                        st.session_state["docs"][r.代碼] = get_text(r.PDF來源)
+                except Exception as e:
+                    st.error(f"{COMPANIES[r.代碼]} 失敗：{e}")
+            if st.session_state["docs"]:
+                st.session_state["lib_year"] = ly
+                run_scoring(list(st.session_state["docs"]))
+                st.success("完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
+        if st.button("🔍 檢查這個年度的連結能不能下載"):
+            res, bar = [], st.progress(0.0)
+            rows_ = list(avail.itertuples())
+            for i, r in enumerate(rows_):
+                res.append({"公司": COMPANIES[r.代碼], "年度": ly, "結果": check_link(r.PDF來源)})
+                bar.progress((i + 1) / len(rows_))
+            st.dataframe(pd.DataFrame(res), use_container_width=True, hide_index=True)
+        with st.expander(f"資料庫清單（共 {len(lib)} 筆）"):
+            st.dataframe(lib, use_container_width=True, hide_index=True)
+    st.divider()
+    st.subheader("🔎 找不到？即時搜尋官網")
     c1, c2, c3 = st.columns([3, 1, 1])
     kw = c1.text_input("輸入關鍵字（公司名稱或代碼，如：合庫金、5880）；或直接貼上企業官網的報告書下載頁網址")
     year = c2.selectbox("年度", [str(y) for y in range(datetime.now().year - 1, 2020, -1)])
@@ -530,12 +644,25 @@ with t1:
                 except Exception as e:
                     st.error(f"{r.歸屬公司} 失敗：{e}")
             if st.session_state["docs"]:
+                st.session_state["lib_year"] = year
                 run_scoring(list(st.session_state["docs"]))
                 st.success("評分完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
                 if st.session_state.get("ssl_relaxed"):
                     st.info("提醒：以下網站的憑證格式不符規範（缺少 Subject Key Identifier），"
                             "已改用免憑證驗證下載公開報告書：" + "、".join(sorted(st.session_state["ssl_relaxed"])))
 
+    if "results" in st.session_state:
+        if st.button("➕ 把勾選的報告書加入資料庫清單"):
+            new_rows = [{"代碼": r.歸屬公司[:7], "年度": year, "PDF來源": r.url, "備註": r.title[:50]}
+                        for r in edited[edited["選取"]].itertuples() if r.歸屬公司]
+            st.session_state.setdefault("lib_draft", []).extend(new_rows)
+            st.success(f"已加入 {len(new_rows)} 筆，請往下查看並下載清單。")
+    if st.session_state.get("lib_draft"):
+        merged = pd.concat([pd.DataFrame(st.session_state["lib_draft"]), load_library()], ignore_index=True)
+        merged = merged.drop_duplicates(["代碼", "年度"], keep="first").sort_values(["年度", "代碼"], ascending=[False, True])
+        st.markdown("**📝 待更新的資料庫清單**（下載後上傳到 GitHub，覆蓋原本的 reports_index.csv）")
+        st.dataframe(merged, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ 下載 reports_index.csv", merged.to_csv(index=False).encode("utf-8-sig"), "reports_index.csv")
     with st.expander("搜尋不到？手動上傳 PDF"):
         ups = st.file_uploader("檔名請含代碼，例如 2884_玉山金.pdf", type="pdf", accept_multiple_files=True)
         for f in ups or []:
