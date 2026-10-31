@@ -61,6 +61,17 @@ class _LaxTLSAdapter(HTTPAdapter):
 SESSION = requests.Session()
 SESSION.mount("https://", _LaxTLSAdapter())
 
+# 某些網站（例如中信金的 IR 平台）只接受從自家網頁連過去的下載，需指定來源頁
+REFERER_OVERRIDE = {"todayir.com": "https://ir.ctbcholding.com/"}
+
+def referer_for(url):
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    for dom, ref in REFERER_OVERRIDE.items():
+        if u.netloc.endswith(dom):
+            return ref
+    return f"{u.scheme}://{u.netloc}/"
+
 def http_get(url, **kw):
     if st.session_state.get("skip_ssl", False):
         urllib3.disable_warnings()
@@ -91,7 +102,7 @@ def fetch_pdf(url):
     from urllib.parse import urlparse
     u = urlparse(url)
     r = http_get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                                               "Referer": f"{u.scheme}://{u.netloc}/"})
+                                               "Referer": referer_for(url)})
     r.raise_for_status()
     return r.content
 
@@ -409,11 +420,11 @@ def load_library():
             frames.append(pd.DataFrame(rows, columns=LIB_COLS))
     if not frames:
         return pd.DataFrame(columns=LIB_COLS)
-    df = pd.concat(frames, ignore_index=True)
+    df = pd.concat(frames[::-1], ignore_index=True)  # 本機檔案排前面，同代碼同年度時優先使用
     df["代碼"] = df["代碼"].map(_norm_code)
     df["年度"] = df["年度"].astype(str).str.extract(r"(\d{4})")[0]
     df = df[df["代碼"].isin(COMPANIES) & df["年度"].notna() & (df["PDF來源"].str.strip() != "")]
-    return df.drop_duplicates(["代碼", "年度"], keep="first").reset_index(drop=True)
+    return df.drop_duplicates(["代碼", "年度"], keep="first").sort_values(["年度", "代碼"], ascending=[False, True]).reset_index(drop=True)
 
 def check_link(src):
     """只讀檔頭前幾個位元組，確認連結真的是 PDF（不會下載整份）。"""
@@ -425,7 +436,7 @@ def check_link(src):
         u = urlparse(normalize_url(src))
         r = http_get(normalize_url(src), timeout=20, stream=True,
                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                              "Referer": f"{u.scheme}://{u.netloc}/"})
+                              "Referer": referer_for(normalize_url(src))})
         head = next(r.iter_content(16), b"")
         status = r.status_code
         r.close()
