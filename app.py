@@ -537,6 +537,14 @@ def get_prices(tickers, start, end):
         cols[t] = d.set_index(pd.to_datetime(d["date"]))["close"]
     return pd.DataFrame(cols), "FinMind(未還原權息)"
 
+def ranked(df):
+    """依總分由高到低排序，加上『排名』欄（從 1 開始，同分並列同名次）。"""
+    d = df.sort_values("總分(平均)", ascending=False).reset_index(drop=True)
+    d.insert(0, "排名", d["總分(平均)"].rank(method="min", ascending=False).astype(int))
+    return d
+
+SCORE_NOTE = "📌 各構面與總分的**滿分為 5 分**（最低 0 分）；總分＝六個構面分數的平均；排名依總分由高到低，同分者並列同名次。"
+
 # ---------------- 回測 ----------------
 def metrics(ret, cum):
     years = max(len(ret) / 252, 1e-9)
@@ -726,8 +734,9 @@ with t2:
         if st.button("🔄 重新評分（調整參數後使用）"):
             run_scoring(list(st.session_state["docs"]))
         if "scores" in st.session_state:
-            st.dataframe(st.session_state["scores"], use_container_width=True, hide_index=True)
-            with st.expander("🔍 原文佐證"):
+            st.info(SCORE_NOTE)
+            st.dataframe(ranked(st.session_state["scores"]), use_container_width=True, hide_index=True)
+            with st.expander("🔍 原文佐證（分數欄滿分為 5 分）"):
                 st.dataframe(st.session_state["evidence"], use_container_width=True, hide_index=True)
 
 # ---------------- Tab3 ----------------
@@ -735,20 +744,27 @@ with t3:
     if "scores" not in st.session_state:
         st.info("請先完成步驟 2。")
     else:
-        sc = st.session_state["scores"].sort_values("總分(平均)", ascending=False)
+        sc = ranked(st.session_state["scores"])
+        st.info(SCORE_NOTE)
+        st.markdown("#### 🏆 總分排名")
+        st.dataframe(sc[["排名", "公司", "總分(平均)"]].rename(columns={"總分(平均)": "總分（滿分 5 分）"}),
+                     use_container_width=True, hide_index=True)
         c1, c2 = st.columns(2)
         with c1:
             st.plotly_chart(px.bar(sc, x="公司", y="總分(平均)", color="總分(平均)",
-                                   color_continuous_scale="Greens", range_y=[0, 5]), use_container_width=True)
+                                   color_continuous_scale="Greens", range_color=[0, 5], range_y=[0, 5],
+                                   title="總分比較（滿分 5 分）",
+                                   labels={"總分(平均)": "總分（滿分 5 分）"}), use_container_width=True)
         with c2:
             fig = go.Figure()
             for _, r in sc.iterrows():
                 fig.add_trace(go.Scatterpolar(r=[r[d] for d in RUBRIC], theta=list(RUBRIC), fill="toself", name=r["公司"]))
-            fig.update_layout(polar=dict(radialaxis=dict(range=[0, 5])))
+            fig.update_layout(title="各構面雷達圖（外圈為滿分 5 分）", polar=dict(radialaxis=dict(range=[0, 5])))
             st.plotly_chart(fig, use_container_width=True)
         heat = sc.set_index("公司")[list(RUBRIC)]
-        st.plotly_chart(px.imshow(heat, text_auto=True, color_continuous_scale="Greens", aspect="auto"),
-                        use_container_width=True)
+        hfig = px.imshow(heat, text_auto=True, color_continuous_scale="Greens", zmin=0, zmax=5, aspect="auto",
+                         title="各構面分數熱力圖（滿分 5 分）")
+        st.plotly_chart(hfig, use_container_width=True)
         st.download_button("下載評分 CSV", sc.to_csv(index=False).encode("utf-8-sig"), "esg_scores.csv")
 
 # ---------------- Tab4 ----------------
