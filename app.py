@@ -1,4 +1,4 @@
-import json, os, re
+import json, os, re, unicodedata
 from datetime import datetime
 
 import numpy as np
@@ -28,19 +28,24 @@ COMPANIES = {
 }
 
 # 評分構面：query 用於語意檢索，keywords 用於判斷揭露深度
+# 關鍵詞規則：
+#  - 一般中文詞：子字串比對；純英數詞（PCAF、2050）：前後不能緊鄰英數字，避免誤中（例如 PCAF 不會中 PCAFX）
+#  - "re:顯示名稱::正規表示式"：進階規則，例如「覆蓋率後面要接著數字 %」，單純出現「%」不算命中
 RUBRIC = {
     "PCAF 方法學": {"query": "依循 PCAF 碳核算金融聯盟方法學 資料品質分數",
-                  "keywords": ["PCAF", "資料品質", "data quality", "歸因", "第二版"]},
+                  "keywords": ["PCAF", "碳核算金融聯盟", "資料品質", "data quality", "第二版", "歸因因子"]},
     "投融資碳排揭露(範疇三類別15)": {"query": "投融資組合碳排放 範疇三 類別15 financed emissions tCO2e",
-                  "keywords": ["範疇三", "投融資", "financed emissions", "類別15", "tCO2e", "噸CO2e", "授信", "投資組合"]},
+                  "keywords": ["範疇三", "投融資", "financed emissions", "re:類別15::(類別|category)\\s*15",
+                               "tCO2e", "re:碳排數字(公噸CO2e)::\\d[\\d,.]*\\s*(公噸|噸)\\s*CO2e", "投資組合"]},
     "盤查覆蓋率": {"query": "投融資碳盤查 資產覆蓋率 涵蓋比例",
-                  "keywords": ["覆蓋率", "涵蓋", "占比", "%", "資產類別"]},
+                  "keywords": ["re:覆蓋率+數字%::覆蓋率[^。；\\n]{0,25}\\d+(\\.\\d+)?\\s*%", "盤查範圍", "資產類別",
+                               "涵蓋率", "coverage"]},
     "第三方確信": {"query": "會計師有限確信 第三方查證 ISO 14064 確信報告",
-                  "keywords": ["確信", "查證", "assurance", "ISO 14064", "會計師"]},
+                  "keywords": ["確信", "查證", "assurance", "ISO 14064", "會計師", "第三方"]},
     "減碳目標": {"query": "SBTi 科學基礎減碳目標 2050 淨零 投融資組合減碳",
                   "keywords": ["SBTi", "科學基礎", "淨零", "2050", "減碳目標", "net zero"]},
     "轉型機制": {"query": "氣候議合 撤資 內部碳定價 煤炭 排除 高碳排授信限制",
-                  "keywords": ["議合", "撤資", "碳定價", "煤", "排除", "轉型", "授信政策"]},
+                  "keywords": ["議合", "撤資", "碳定價", "煤炭", "轉型成熟度", "轉型計畫"]},
 }
 
 # ---------------- 網路請求（放寬 TLS 嚴格檢查） ----------------
@@ -93,8 +98,17 @@ def extract_pdf(data: bytes) -> str:
     reader = PdfReader(io.BytesIO(data))
     return "\n".join((p.extract_text() or "") for p in reader.pages)
 
+# 只保留：英數、常見標點、全形/半形符號、中日韓文字；其餘（亂碼、私用區字元、泰文/藏文等）一律移除
+_BAD_CHARS = re.compile(r"[^\t\n\x20-\x7e\xa0-\xff\u2010-\u2027\u2030-\u203a\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff]")
+
+def clean_text(text):
+    """NFKC 正規化（全形英數→半形、下標 CO₂→CO2、康熙部首→一般漢字），再移除亂碼字元。"""
+    text = unicodedata.normalize("NFKC", text)
+    text = _BAD_CHARS.sub(" ", text)
+    return re.sub(r"\s+", " ", text)
+
 def chunk_text(text, size=500, overlap=50):
-    text = re.sub(r"\s+", " ", text)
+    text = clean_text(text)
     step = max(1, size - overlap)
     return [text[i:i + size] for i in range(0, len(text), step) if text[i:i + size].strip()]
 
@@ -107,21 +121,40 @@ def fetch_pdf(url):
     return r.content
 
 # ---------------- RAG 檢索 + 評分 ----------------
+def _strip_punct(s):
+    return re.sub(r"[\W_]+", " ", s.lower())  # 檢索比對時去掉標點符號，只看文字本身
+
 def retrieve(chunks, query, top_k=5):
-    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3))
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), preprocessor=_strip_punct)
     mat = vec.fit_transform(chunks + [query])
     sims = cosine_similarity(mat[-1], mat[:-1]).ravel()
     idx = sims.argsort()[::-1][:top_k]
     return [chunks[i] for i in idx]
 
+def _kw_parts(k):
+    if k.startswith("re:"):
+        label, pat = k[3:].split("::", 1)
+        return label, re.compile(pat, re.I)
+    if re.fullmatch(r"[A-Za-z0-9 .\-]+", k):
+        pat = re.escape(k).replace(r"\ ", r"\s*")
+        return k, re.compile(r"(?<![A-Za-z0-9])" + pat + r"(?![A-Za-z0-9])", re.I)
+    return k, re.compile(re.escape(k))
+
 def rule_score(top_chunks, keywords):
-    joined = " ".join(top_chunks).lower()
-    hit = [k for k in keywords if k.lower() in joined]
+    joined = " ".join(top_chunks)
+    pats = [_kw_parts(k) for k in keywords]
+    hit = [lab for lab, p in pats if p.search(joined)]
     if not hit:
         return 0.0, [], ""
     score = min(5.0, 1 + 4 * len(hit) / len(keywords))
-    best = max(top_chunks, key=lambda c: sum(k.lower() in c.lower() for k in keywords))
-    return round(score, 1), hit, best
+    best = max(top_chunks, key=lambda c: sum(bool(p.search(c)) for _, p in pats))
+    m = next((p.search(best) for _, p in pats if p.search(best)), None)
+    if m is None:
+        snippet = best[:200]
+    else:
+        a, b = max(0, m.start() - 100), min(len(best), m.end() + 100)
+        snippet = ("…" if a else "") + best[a:m.start()] + "【" + m.group() + "】" + best[m.end():b] + ("…" if b < len(best) else "")
+    return round(score, 1), hit, snippet
 
 def llm_review(name, dim, evidence, endpoint, token, model):
     """只根據檢索到的原文評分，找不到證據就給 0 分。失敗回傳 None。"""
