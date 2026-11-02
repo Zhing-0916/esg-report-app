@@ -706,8 +706,8 @@ def metrics(ret, cum):
 st.sidebar.title("🌿 控制面板")
 picked = st.sidebar.multiselect("選擇金控", list(COMPANIES), default=list(COMPANIES)[:5],
                                 format_func=lambda t: f"{t} {COMPANIES[t]}")
-top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 10, 5)
-chunk_size = st.sidebar.slider("Chunk 字數", 200, 1000, 500)
+top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 8, 5)
+chunk_size = st.sidebar.slider("Chunk 字數", 300, 800, 500)
 overlap = st.sidebar.slider("Overlap 字數", 0, 200, 50)
 min_sim = st.sidebar.slider("相似度門檻（0＝不限制）", 0.0, 0.3, 0.0, 0.01,
                            help="低於此相似度的段落不會被採用。TF-IDF 相似度通常落在 0.05–0.4，建議 0.05 以內；設太高會讓構面找不到證據而變 0 分。")
