@@ -1,4 +1,5 @@
 import json, os, re, unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -37,9 +38,9 @@ RUBRIC = {
     "投融資碳排揭露(範疇三類別15)": {"query": "投融資組合碳排放 範疇三 類別15 financed emissions tCO2e",
                   "keywords": ["範疇三", "投融資", "financed emissions", "re:類別15::(類別|category)\\s*15",
                                "tCO2e", "re:碳排數字(公噸CO2e)::\\d[\\d,.]*\\s*(公噸|噸)\\s*CO2e", "投資組合"]},
-    "盤查覆蓋率": {"query": "投融資碳盤查 資產覆蓋率 涵蓋比例",
-                  "keywords": ["re:覆蓋率+數字%::覆蓋率[^。；\\n]{0,25}\\d+(\\.\\d+)?\\s*%", "盤查範圍", "資產類別",
-                               "涵蓋率", "coverage"]},
+    "盤查覆蓋率": {"query": "投融資組合財務碳排放盤查 盤查覆蓋率 資產類別 涵蓋比例",
+                  "keywords": ["re:覆蓋率+數字%::覆蓋率[^。；\\n]{0,25}\\d+(\\.\\d+)?\\s*%", "盤查覆蓋率", "盤查範圍", "資產類別",
+                               "re:碳盤查涵蓋比例::(投融資|碳盤查|碳排)[^。；\\n]{0,30}(涵蓋|覆蓋)[^。；\\n]{0,10}\\d+(\\.\\d+)?\\s*%"]},
     "第三方確信": {"query": "會計師有限確信 第三方查證 ISO 14064 確信報告",
                   "keywords": ["確信", "查證", "assurance", "ISO 14064", "會計師", "第三方"]},
     "減碳目標": {"query": "SBTi 科學基礎減碳目標 2050 淨零 投融資組合減碳",
@@ -77,8 +78,10 @@ def referer_for(url):
             return ref
     return f"{u.scheme}://{u.netloc}/"
 
+_NET = {"skip_ssl": False, "relaxed": set()}  # 由主執行緒設定；背景執行緒只讀取，不呼叫 st 函式
+
 def http_get(url, **kw):
-    if st.session_state.get("skip_ssl", False):
+    if _NET["skip_ssl"]:
         urllib3.disable_warnings()
         return requests.get(url, verify=False, **kw)
     try:
@@ -88,7 +91,7 @@ def http_get(url, **kw):
         if "Subject Key Identifier" not in str(e):
             raise
         from urllib.parse import urlparse
-        st.session_state.setdefault("ssl_relaxed", set()).add(urlparse(url).netloc)
+        _NET["relaxed"].add(urlparse(url).netloc)
         urllib3.disable_warnings()
         return requests.get(url, verify=False, **kw)
 
@@ -96,7 +99,7 @@ def http_get(url, **kw):
 def extract_pdf(data: bytes) -> str:
     import io
     reader = PdfReader(io.BytesIO(data))
-    return "\n".join((p.extract_text() or "") for p in reader.pages)
+    return "\f".join((p.extract_text() or "") for p in reader.pages)  # \f 分隔頁面，供後續標註頁碼
 
 # 只保留：英數、常見標點、全形/半形符號、中日韓文字；其餘（亂碼、私用區字元、泰文/藏文等）一律移除
 _BAD_CHARS = re.compile(r"[^\t\n\x20-\x7e\xa0-\xff\u2010-\u2027\u2030-\u203a\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff]")
@@ -108,9 +111,18 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text)
 
 def chunk_text(text, size=500, overlap=50):
-    text = clean_text(text)
-    step = max(1, size - overlap)
-    return [text[i:i + size] for i in range(0, len(text), step) if text[i:i + size].strip()]
+    """逐頁切塊：每塊開頭帶 [pN] 標籤（PDF 第 N 頁），之後佐證可以標示出處頁碼。"""
+    chunks, step = [], max(1, size - overlap)
+    for pno, page in enumerate(text.split("\f"), start=1):
+        page = clean_text(page)
+        for i in range(0, len(page), step):
+            piece = page[i:i + size]
+            if not piece.strip() or (i > 0 and len(piece) <= overlap):
+                continue
+            chunks.append(f"[p{pno}] {piece}")
+    return chunks
+
+_PAGE_TAG = re.compile(r"^\[p(\d+)\]\s*")
 
 def fetch_pdf(url):
     from urllib.parse import urlparse
@@ -122,14 +134,15 @@ def fetch_pdf(url):
 
 # ---------------- RAG 檢索 + 評分 ----------------
 def _strip_punct(s):
+    s = _PAGE_TAG.sub("", s)  # 頁碼標籤不參與相似度計算
     return re.sub(r"[\W_]+", " ", s.lower())  # 檢索比對時去掉標點符號，只看文字本身
 
 def retrieve(chunks, query, top_k=5):
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), preprocessor=_strip_punct)
     mat = vec.fit_transform(chunks + [query])
     sims = cosine_similarity(mat[-1], mat[:-1]).ravel()
-    idx = sims.argsort()[::-1][:top_k]
-    return [chunks[i] for i in idx]
+    idx = [i for i in sims.argsort()[::-1][:top_k] if sims[i] >= globals().get("min_sim", 0.0)]
+    return [chunks[i] for i in idx]  # 低於相似度門檻的段落直接捨棄（門檻 0 = 不限制）
 
 def _kw_parts(k):
     if k.startswith("re:"):
@@ -141,26 +154,44 @@ def _kw_parts(k):
     return k, re.compile(re.escape(k))
 
 def rule_score(top_chunks, keywords):
-    joined = " ".join(top_chunks)
+    joined = " ".join(_PAGE_TAG.sub("", c) for c in top_chunks)
     pats = [_kw_parts(k) for k in keywords]
     hit = [lab for lab, p in pats if p.search(joined)]
     if not hit:
         return 0.0, [], ""
     score = min(5.0, 1 + 4 * len(hit) / len(keywords))
-    best = max(top_chunks, key=lambda c: sum(bool(p.search(c)) for _, p in pats))
+    best = max(top_chunks, key=lambda c: sum(bool(p.search(_PAGE_TAG.sub("", c))) for _, p in pats))
+    pm = _PAGE_TAG.match(best)
+    page_label = f"（PDF 第 {pm.group(1)} 頁）" if pm else ""
+    best = _PAGE_TAG.sub("", best)
     m = next((p.search(best) for _, p in pats if p.search(best)), None)
     if m is None:
         snippet = best[:200]
     else:
         a, b = max(0, m.start() - 100), min(len(best), m.end() + 100)
         snippet = ("…" if a else "") + best[a:m.start()] + "【" + m.group() + "】" + best[m.end():b] + ("…" if b < len(best) else "")
-    return round(score, 1), hit, snippet
+    return round(score, 1), hit, page_label + snippet
+
+def make_tfidf(chunks):
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), preprocessor=_strip_punct)
+    return vec, vec.fit_transform(chunks)
+
+def retrieve_fast(chunks, vec, mat, query, k):
+    """用已建好的 TF-IDF 索引檢索（6 個構面共用同一份索引，不用重複建立）。"""
+    sims = cosine_similarity(vec.transform([query]), mat).ravel()
+    idx = [i for i in sims.argsort()[::-1][:k] if sims[i] >= globals().get("min_sim", 0.0)]
+    return [chunks[i] for i in idx]
 
 def llm_review(name, dim, evidence, endpoint, token, model):
     """只根據檢索到的原文評分，找不到證據就給 0 分。失敗回傳 None。"""
-    prompt = (f"以下是 {name} 永續報告書中與『{dim}』相關的原文片段。\n"
-              "只能依據這些片段評分，片段中沒有證據請給 0 分。\n"
-              "請只回傳 JSON：{\"score\": 0-5 的數字, \"reason\": \"一句話理由\"}\n\n"
+    prompt = (f"你是金融業永續報告書評鑑助理。以下是 {name} 永續報告書中與『{dim}』相關的原文片段，"
+              "每段開頭的 [pN] 代表 PDF 第 N 頁。\n"
+              "規則：\n"
+              "1. 只能根據提供的片段評分，不可使用片段以外的知識或自行推測。\n"
+              "2. 片段中沒有相關證據時，score 必須是 0，reason 寫「根據目前資料無法判斷」。\n"
+              "3. 評分標準：0=完全沒有證據；1-2=只有概略提及；3-4=有具體做法或數據；5=完整揭露，且有數據、方法與查證。\n"
+              "4. reason 用一句話說明依據，並在 pages 列出你引用的頁碼。\n"
+              "請只回傳 JSON：{\"score\": 0-5 的數字, \"reason\": \"一句話理由\", \"pages\": [頁碼數字]}\n\n"
               + "\n---\n".join(evidence))
     try:
         import time
@@ -176,7 +207,9 @@ def llm_review(name, dim, evidence, endpoint, token, model):
         r.raise_for_status()
         txt = r.json()["choices"][0]["message"]["content"]
         j = json.loads(re.search(r"\{.*\}", txt, re.S).group())
-        return float(j["score"]), str(j.get("reason", ""))
+        pages = [str(p) for p in (j.get("pages") or []) if str(p).isdigit()]
+        reason = str(j.get("reason", "")) + (f"（依據 PDF 第 {', '.join(pages)} 頁）" if pages else "")
+        return max(0.0, min(5.0, float(j["score"]))), reason
     except Exception:
         return None
 
@@ -479,38 +512,152 @@ def check_link(src):
     except Exception as e:
         return f"❌ {type(e).__name__}"
 
-@st.cache_data(show_spinner=False, max_entries=40)
-def get_text(src):
-    """從資料庫取得報告書全文（結果會快取，同一份不會重複下載解析）。"""
+@st.cache_resource
+def _text_cache():
+    return {}  # 跨使用者共用的報告書全文快取（同一份報告書不會重複下載、解析）
+
+def get_text(src, cache=None):
+    """取得報告書全文。不呼叫任何 st 函式，所以可以安全地在背景執行緒中執行。"""
+    cache = _text_cache() if cache is None else cache
+    if src in cache:
+        return cache[src]
     if str(src).lower().startswith("http"):
-        return load_report(normalize_url(src))
-    with open(os.path.join(BASE_DIR, "reports", src), "rb") as f:
-        text = extract_pdf(f.read())
-    if len(text) < 1000:
-        raise ValueError("PDF 幾乎抽不到文字（可能是掃描檔）")
+        text = load_report(normalize_url(src))
+    else:
+        with open(os.path.join(BASE_DIR, "reports", src), "rb") as f:
+            text = extract_pdf(f.read())
+        if len(text) < 1000:
+            raise ValueError("PDF 幾乎抽不到文字（可能是掃描檔）")
+    if len(cache) >= 40:
+        cache.pop(next(iter(cache)))
+    cache[src] = text
     return text
 
-def run_scoring(tickers):
-    rows, evidence = [], []
-    bar = st.progress(0.0)
+def load_texts_parallel(items, workers=3):
+    """同時下載並解析多份報告書。items = [(代碼, 來源), ...]；回傳 {代碼: 全文 或 Exception}。"""
+    cache = _text_cache()  # 在主執行緒取得，再交給背景執行緒使用
+
+    def one(it):
+        t, src = it
+        try:
+            return t, get_text(src, cache)
+        except Exception as e:
+            return t, e
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return dict(ex.map(one, items))
+
+QDRANT_COLLECTION = secret("QDRANT_COLLECTION", "esg_report_chunks")
+
+@st.cache_resource
+def get_qdrant():
+    from qdrant_client import QdrantClient
+    return QdrantClient(url=secret("QDRANT_URL"), api_key=secret("QDRANT_API_KEY"), timeout=30)
+
+@st.cache_data(show_spinner=False)
+def load_query_vectors():
+    """6 個構面的檢索問句向量（由 build_index.py 事先算好），網站不需要載入 embedding 模型。"""
+    p = os.path.join(BASE_DIR, "query_vectors.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+def _qdrant_filter(ticker, year):
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    return Filter(must=[FieldCondition(key="ticker", match=MatchValue(value=ticker)),
+                        FieldCondition(key="year", match=MatchValue(value=str(year)))])
+
+def vector_retrieve(ticker, year, dim, qvecs):
+    """比照老師範例：query_points + score_threshold + 以 ticker / year 做 metadata 過濾。"""
+    res = get_qdrant().query_points(
+        collection_name=QDRANT_COLLECTION, query=qvecs["queries"][dim]["vector"],
+        query_filter=_qdrant_filter(ticker, year), limit=vec_top_k, score_threshold=vec_threshold,
+        with_payload=True)
+    pts = res.points
+    return [f"[p{p.payload.get('page', 0)}] {p.payload.get('text', '')}" for p in pts], (pts[0].score if pts else None)
+
+def index_count(ticker, year):
+    return get_qdrant().count(collection_name=QDRANT_COLLECTION, count_filter=_qdrant_filter(ticker, year),
+                              exact=True).count
+
+def run_scoring(tickers, mode="basic"):
+    """mode='basic'：TF-IDF 檢索（需已載入報告書全文）；mode='vector'：Qdrant 向量檢索。成功回傳 True。"""
+    qvecs = None
+    if mode == "vector":
+        qvecs = load_query_vectors()
+        if not qvecs:
+            st.error("找不到 query_vectors.json。請先執行 build_index.py，並把產生的 query_vectors.json 上傳到 GitHub。")
+            return False
+        bad = [d for d, c in RUBRIC.items() if qvecs.get("queries", {}).get(d, {}).get("query") != c["query"]]
+        if bad:
+            st.error("query_vectors.json 的檢索問句和目前的 app.py 不一致（" + "、".join(bad)
+                     + "）。請重新執行 build_index.py 更新。")
+            return False
+    year = st.session_state.get("lib_year", "")
+    bar = st.progress(0.0, text="檢索與規則評分中…")
+
+    # 階段 1：檢索 + 規則評分（很快）
+    base, jobs = {}, {}
+    tcache = st.session_state.setdefault("tfidf_cache", {})
     for i, t in enumerate(tickers):
-        chunks = chunk_text(st.session_state["docs"][t], chunk_size, overlap)
-        row = {"代碼": t, "公司": COMPANIES[t], "年度": st.session_state.get("lib_year", "")}
+        if mode == "basic":
+            key = (t, chunk_size, overlap, len(st.session_state["docs"][t]))
+            if key not in tcache:
+                if len(tcache) > 30:
+                    tcache.clear()
+                chunks = chunk_text(st.session_state["docs"][t], chunk_size, overlap)
+                tcache[key] = (chunks, *make_tfidf(chunks))
+            chunks, vec, mat = tcache[key]
         for dim, cfg in RUBRIC.items():
-            top = retrieve(chunks, cfg["query"], top_k)
+            sim = None
+            if mode == "vector":
+                try:
+                    top, sim = vector_retrieve(t, year, dim, qvecs)
+                except Exception as e:
+                    st.error(f"向量檢索失敗：{type(e).__name__}: {str(e)[:200]}")
+                    return False
+            else:
+                top = retrieve_fast(chunks, vec, mat, cfg["query"], top_k)
             sc_, hit, best = rule_score(top, cfg["keywords"])
             reason = f"命中關鍵詞：{', '.join(hit) or '無'}"
-            if use_llm and token and hit:
-                r = llm_review(COMPANIES[t], dim, top, endpoint, token, model)
-                if r:
-                    sc_, reason = r
+            if mode == "vector" and not top:
+                reason = f"沒有段落達到相似度門檻（{vec_threshold}）"
+            base[(t, dim)] = (sc_, reason, best, sim)
+            if use_llm and token and top and (llm_ungated or hit):
+                jobs[(t, dim)] = top
+        bar.progress(0.5 * (i + 1) / len(tickers), text="檢索與規則評分中…")
+
+    # 階段 2：LLM 複核（多個請求同時送出）
+    llm_res = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=llm_workers) as ex:
+            futs = {ex.submit(llm_review, COMPANIES[t], dim, top, endpoint, token, model): (t, dim)
+                    for (t, dim), top in jobs.items()}
+            for n, f in enumerate(as_completed(futs), 1):
+                llm_res[futs[f]] = f.result()
+                bar.progress(0.5 + 0.5 * n / len(jobs), text=f"LLM 複核 {n}/{len(jobs)}")
+    bar.progress(1.0, text="完成")
+
+    # 階段 3：整理結果
+    rows, evidence = [], []
+    for t in tickers:
+        row = {"代碼": t, "公司": COMPANIES[t], "年度": year}
+        for dim in RUBRIC:
+            sc_, reason, best, sim = base[(t, dim)]
+            r = llm_res.get((t, dim))
+            if r:
+                sc_, reason = r
             row[dim] = sc_
-            evidence.append({"公司": COMPANIES[t], "構面": dim, "分數": sc_, "說明": reason, "原文佐證": best[:300]})
+            evidence.append({"公司": COMPANIES[t], "構面": dim, "分數": sc_, "說明": reason,
+                             "最高相似度": round(sim, 3) if sim is not None else None, "原文佐證": best[:300]})
         row["總分(平均)"] = round(float(np.mean([row[d] for d in RUBRIC])), 2)
         rows.append(row)
-        bar.progress((i + 1) / len(tickers))
     st.session_state["scores"] = pd.DataFrame(rows)
     st.session_state["evidence"] = pd.DataFrame(evidence)
+    st.session_state["scored_mode"] = mode
+    st.session_state["scored_tickers"] = list(tickers)
+    return True
 
 
 def get_prices(tickers, start, end):
@@ -559,12 +706,31 @@ def metrics(ret, cum):
 st.sidebar.title("🌿 控制面板")
 picked = st.sidebar.multiselect("選擇金控", list(COMPANIES), default=list(COMPANIES)[:5],
                                 format_func=lambda t: f"{t} {COMPANIES[t]}")
-top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 8, 5)
-chunk_size = st.sidebar.slider("Chunk 字數", 300,800, 500)
+top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 10, 5)
+chunk_size = st.sidebar.slider("Chunk 字數", 200, 1000, 500)
 overlap = st.sidebar.slider("Overlap 字數", 0, 200, 50)
+min_sim = st.sidebar.slider("相似度門檻（0＝不限制）", 0.0, 0.3, 0.0, 0.01,
+                           help="低於此相似度的段落不會被採用。TF-IDF 相似度通常落在 0.05–0.4，建議 0.05 以內；設太高會讓構面找不到證據而變 0 分。")
+
+st.sidebar.subheader("🔎 檢索模式")
+retrieval_mode = st.sidebar.radio("檢索模式", ["基礎（TF-IDF，預設）", "向量檢索（Qdrant，比照老師範例）"],
+                                  label_visibility="collapsed")
+vector_mode = retrieval_mode.startswith("向量")
+vec_top_k, vec_threshold = 10, 0.65  # 老師範例的設定：top_k=10、score_threshold=0.65
+if vector_mode:
+    vec_top_k = st.sidebar.slider("向量檢索 top-k", 3, 20, 10)
+    vec_threshold = st.sidebar.slider("相似度門檻 score_threshold", 0.0, 0.95, 0.65, 0.01,
+                                      help="老師範例用 0.65。門檻太高會找不到段落、構面變 0 分；太低則會混入不相關內容。")
+    st.sidebar.caption("向量模式只用於「📚 報告書資料庫」，需先用 build_index.py 建好索引。")
+    if not (secret("QDRANT_URL") and secret("QDRANT_API_KEY")):
+        st.sidebar.warning("尚未在 Secrets 設定 QDRANT_URL / QDRANT_API_KEY")
 
 st.sidebar.subheader("🔑 LLM 複核（選用）")
 use_llm = st.sidebar.checkbox("啟用 LLM 依檢索證據複核評分", value=False)
+llm_ungated = st.sidebar.checkbox("LLM 不受關鍵詞限制（只要檢索到段落就交給 LLM 判斷）", value=True,
+                                  help="關閉時：只有關鍵詞命中的構面才會交給 LLM，沒命中直接 0 分。")
+llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 3,
+                                help="越大越快，但免費額度容易被限流（429）；被限流的項目會退回關鍵詞分數。")
 endpoint = st.sidebar.text_input("API Endpoint", secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions"))
 # 安全做法：Secrets 裡的 key 只在伺服器端使用，絕不預填到網頁欄位（否則按「眼睛」圖示就看得到）
 _SECRET_TOKEN = secret("CUSTOM_API_TOKEN")
@@ -601,6 +767,7 @@ if st.sidebar.button("🔌 測試 API 連線"):
         st.sidebar.error(f"無法連線：{e}")
 
 st.sidebar.checkbox("略過 SSL 憑證驗證（疑難排解用，預設不要勾）", key="skip_ssl")
+_NET["skip_ssl"] = bool(st.session_state.get("skip_ssl", False))
 
 st.session_state.setdefault("docs", {})
 
@@ -621,17 +788,41 @@ with t1:
         picks = st.multiselect("選擇公司（同一年度才能公平比較）", list(names), default=list(names),
                                format_func=lambda x: names[x])
         if st.button("⚡ 從資料庫載入並評分", type="primary") and picks:
-            st.session_state["docs"] = {}
-            for r in avail[avail["代碼"].isin(picks)].itertuples():
+            if vector_mode:
+                ready_ = []
                 try:
-                    with st.spinner(f"載入 {COMPANIES[r.代碼]} {ly} 年報告書…"):
-                        st.session_state["docs"][r.代碼] = get_text(r.PDF來源)
+                    for t in picks:
+                        if index_count(t, ly) > 0:
+                            ready_.append(t)
+                        else:
+                            st.warning(f"{COMPANIES[t]} {ly} 年尚未建立向量索引，已略過（請先執行 build_index.py）")
                 except Exception as e:
-                    st.error(f"{COMPANIES[r.代碼]} 失敗：{e}")
-            if st.session_state["docs"]:
-                st.session_state["lib_year"] = ly
-                run_scoring(list(st.session_state["docs"]))
-                st.success("完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
+                    st.error(f"連線 Qdrant 失敗：{type(e).__name__}: {str(e)[:200]}")
+                    ready_ = []
+                if ready_:
+                    st.session_state["lib_year"] = ly
+                    if run_scoring(ready_, mode="vector"):
+                        st.success("完成（向量檢索）！請到「步驟 2」看明細、「步驟 3」看公司比較。")
+            else:
+                st.session_state["docs"] = {}
+                items = [(r.代碼, r.PDF來源) for r in avail[avail["代碼"].isin(picks)].itertuples()]
+                with st.spinner(f"同時下載並解析 {len(items)} 份 {ly} 年報告書…（第一次較久，之後會用快取）"):
+                    loaded = load_texts_parallel(items, workers=3)
+                for t, res in loaded.items():
+                    if isinstance(res, Exception):
+                        st.error(f"{COMPANIES[t]} 失敗：{res}")
+                    else:
+                        st.session_state["docs"][t] = res
+                if st.session_state["docs"]:
+                    st.session_state["lib_year"] = ly
+                    run_scoring(list(st.session_state["docs"]))
+                    st.success("完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
+        if vector_mode and st.button("📊 查看這個年度的向量索引狀態"):
+            try:
+                st.dataframe(pd.DataFrame([{"公司": COMPANIES[r.代碼], "年度": ly, "已索引片段數": index_count(r.代碼, ly)}
+                                           for r in avail.itertuples()]), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"連線 Qdrant 失敗：{type(e).__name__}: {str(e)[:200]}")
         if st.button("🔍 檢查這個年度的連結能不能下載"):
             res, bar = [], st.progress(0.0)
             rows_ = list(avail.itertuples())
@@ -699,9 +890,9 @@ with t1:
                 st.session_state["lib_year"] = year
                 run_scoring(list(st.session_state["docs"]))
                 st.success("評分完成！請到「步驟 2」看明細、「步驟 3」看公司比較。")
-                if st.session_state.get("ssl_relaxed"):
+                if _NET["relaxed"]:
                     st.info("提醒：以下網站的憑證格式不符規範（缺少 Subject Key Identifier），"
-                            "已改用免憑證驗證下載公開報告書：" + "、".join(sorted(st.session_state["ssl_relaxed"])))
+                            "已改用免憑證驗證下載公開報告書：" + "、".join(sorted(_NET["relaxed"])))
 
     if "results" in st.session_state:
         if st.button("➕ 把勾選的報告書加入資料庫清單"):
@@ -728,11 +919,16 @@ with t1:
 # ---------------- Tab2 ----------------
 with t2:
     st.caption("評分只依據報告書原文：先語意檢索相關段落，再依揭露深度打分（可選 LLM 複核）；找不到證據即為 0 分。")
-    if not st.session_state["docs"]:
+    if "scores" not in st.session_state and not st.session_state["docs"]:
         st.info("請先在步驟 1 搜尋並載入報告書。")
     else:
+        _mode = st.session_state.get("scored_mode", "basic")
+        st.caption("目前評分使用的檢索模式：" + ("向量檢索（Qdrant）" if _mode == "vector" else "基礎（TF-IDF）"))
         if st.button("🔄 重新評分（調整參數後使用）"):
-            run_scoring(list(st.session_state["docs"]))
+            if _mode == "vector":
+                run_scoring(st.session_state.get("scored_tickers", []), mode="vector")
+            else:
+                run_scoring(list(st.session_state["docs"]))
         if "scores" in st.session_state:
             st.info(SCORE_NOTE)
             st.dataframe(ranked(st.session_state["scores"]), use_container_width=True, hide_index=True)
