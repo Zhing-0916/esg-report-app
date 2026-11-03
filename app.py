@@ -704,10 +704,8 @@ def metrics(ret, cum):
 
 # ---------------- 側邊欄 ----------------
 st.sidebar.title("🌿 控制面板")
-picked = st.sidebar.multiselect("選擇金控", list(COMPANIES), default=list(COMPANIES)[:5],
-                                format_func=lambda t: f"{t} {COMPANIES[t]}")
-top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 8, 5)
-chunk_size = st.sidebar.slider("Chunk 字數", 300, 800, 500)
+top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 10, 5)
+chunk_size = st.sidebar.slider("Chunk 字數", 200, 1000, 500)
 overlap = st.sidebar.slider("Overlap 字數", 0, 200, 50)
 min_sim = st.sidebar.slider("相似度門檻（0＝不限制）", 0.0, 0.3, 0.0, 0.01,
                            help="低於此相似度的段落不會被採用。TF-IDF 相似度通常落在 0.05–0.4，建議 0.05 以內；設太高會讓構面找不到證據而變 0 分。")
@@ -731,43 +729,18 @@ llm_ungated = st.sidebar.checkbox("LLM 不受關鍵詞限制（只要檢索到�
                                   help="關閉時：只有關鍵詞命中的構面才會交給 LLM，沒命中直接 0 分。")
 llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 3,
                                 help="越大越快，但免費額度容易被限流（429）；被限流的項目會退回關鍵詞分數。")
-endpoint = st.sidebar.text_input("API Endpoint", secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions"))
-# 安全做法：Secrets 裡的 key 只在伺服器端使用，絕不預填到網頁欄位（否則按「眼睛」圖示就看得到）
+# LLM 連線設定一律從 Secrets 讀取，不在網頁上顯示或讓訪客輸入
+endpoint = secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+model = secret("LLM_MODEL", "gpt-4o-mini")
 _SECRET_TOKEN = secret("CUSTOM_API_TOKEN")
-_ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，訪客要輸入密碼才能使用你的 key
-_user_token = st.sidebar.text_input("（選填）使用你自己的 API key", "", type="password")
+_ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，要輸入密碼才能使用你的 key（有設定才會出現輸入框）
 _allowed = bool(_SECRET_TOKEN)
 if _SECRET_TOKEN and _ACCESS_CODE:
     _allowed = st.sidebar.text_input("LLM 功能使用密碼", "", type="password") == _ACCESS_CODE
-token = _user_token or (_SECRET_TOKEN if _allowed else "")
-if token and not _user_token:
-    st.sidebar.caption("✅ 已使用網站管理者設定的 API key（不會顯示在網頁上）")
-model = st.sidebar.text_input("模型名稱", secret("LLM_MODEL", "gpt-4o-mini"))
-
-if st.sidebar.button("📋 列出此帳號可用的模型"):
-    try:
-        mr = requests.get(endpoint.replace("/chat/completions", "/models"), timeout=20,
-                          headers={"Authorization": f"Bearer {token}"})
-        mr.raise_for_status()
-        st.sidebar.code("\n".join(sorted(m["id"] for m in mr.json().get("data", []))))
-    except Exception as e:
-        st.sidebar.error(f"查詢失敗：{e}")
-
-if st.sidebar.button("🔌 測試 API 連線"):
-    try:
-        r = requests.post(endpoint, timeout=20,
-                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                          json={"model": model, "max_tokens": 5,
-                                "messages": [{"role": "user", "content": "回覆OK"}]})
-        if r.ok:
-            st.sidebar.success("連線成功")
-        else:
-            st.sidebar.error(f"失敗 {r.status_code}：{r.text[:200]}")
-    except Exception as e:
-        st.sidebar.error(f"無法連線：{e}")
-
-st.sidebar.checkbox("略過 SSL 憑證驗證（疑難排解用，預設不要勾）", key="skip_ssl")
-_NET["skip_ssl"] = bool(st.session_state.get("skip_ssl", False))
+token = _SECRET_TOKEN if _allowed else ""
+if use_llm and not token:
+    st.sidebar.warning("LLM 複核尚未生效：請在 Secrets 設定 CUSTOM_API_TOKEN（若有設使用密碼，請輸入密碼）。")
+_NET["skip_ssl"] = False
 
 st.session_state.setdefault("docs", {})
 
