@@ -183,7 +183,7 @@ def retrieve_fast(chunks, vec, mat, query, k):
     return [chunks[i] for i in idx]
 
 def llm_review(name, dim, evidence, endpoint, token, model):
-    """只根據檢索到的原文評分，找不到證據就給 0 分。失敗回傳 None。"""
+    """只根據檢索到的原文評分，找不到證據就給 0 分。回傳 ((分數, 理由) 或 None, 失敗原因)。"""
     prompt = (f"你是金融業永續報告書評鑑助理。以下是 {name} 永續報告書中與『{dim}』相關的原文片段，"
               "每段開頭的 [pN] 代表 PDF 第 N 頁。\n"
               "規則：\n"
@@ -193,25 +193,46 @@ def llm_review(name, dim, evidence, endpoint, token, model):
               "4. reason 用一句話說明依據，並在 pages 列出你引用的頁碼。\n"
               "請只回傳 JSON：{\"score\": 0-5 的數字, \"reason\": \"一句話理由\", \"pages\": [頁碼數字]}\n\n"
               + "\n---\n".join(evidence))
-    try:
-        import time
-        for _ in range(2):
-            r = requests.post(endpoint, timeout=40,
+    import random
+    import time
+    last = "未知錯誤"
+    for attempt in range(4):
+        try:
+            r = requests.post(endpoint, timeout=60,
                               headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                               json={"model": model, "temperature": 0,
                                     "messages": [{"role": "user", "content": prompt}]})
-            if r.status_code == 429:  # 免費額度常見的限流：等幾秒再試一次
-                time.sleep(4)
-                continue
-            break
-        r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"]
-        j = json.loads(re.search(r"\{.*\}", txt, re.S).group())
-        pages = [str(p) for p in (j.get("pages") or []) if str(p).isdigit()]
-        reason = str(j.get("reason", "")) + (f"（依據 PDF 第 {', '.join(pages)} 頁）" if pages else "")
-        return max(0.0, min(5.0, float(j["score"]))), reason
-    except Exception:
-        return None
+        except requests.exceptions.Timeout:
+            last = "連線逾時"
+            time.sleep(2 * (attempt + 1))
+            continue
+        except Exception as e:
+            last = f"連線錯誤 {type(e).__name__}"
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 429:  # 被限流：優先依伺服器建議的等待秒數，沒有就逐次加倍
+            last = "HTTP 429 被限流"
+            try:
+                wait = float(r.headers.get("retry-after", ""))
+            except ValueError:
+                wait = 4 * (2 ** attempt)
+            time.sleep(min(wait, 30) + random.random())
+            continue
+        if r.status_code >= 500:
+            last = f"HTTP {r.status_code} 伺服器錯誤"
+            time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code >= 400:  # 金鑰、模型名稱、網址錯誤等：重試沒有用，直接回報
+            return None, f"HTTP {r.status_code}：{r.text[:80]}"
+        try:
+            txt = r.json()["choices"][0]["message"]["content"] or ""
+            j = json.loads(re.search(r"\{.*\}", txt, re.S).group())
+            pages = [str(p) for p in (j.get("pages") or []) if str(p).isdigit()]
+            reason = str(j.get("reason", "")) + (f"（依據 PDF 第 {', '.join(pages)} 頁）" if pages else "")
+            return (max(0.0, min(5.0, float(j["score"]))), reason), ""
+        except Exception:
+            last = "回傳格式無法解析"
+    return None, last
 
 
 def guess_company(text):
@@ -583,6 +604,9 @@ def index_count(ticker, year):
 
 def run_scoring(tickers, mode="basic"):
     """mode='basic'：TF-IDF 檢索（需已載入報告書全文）；mode='vector'：Qdrant 向量檢索。成功回傳 True。"""
+    if not token:
+        st.error("尚未設定 LLM（CUSTOM_API_TOKEN / API_ENDPOINT / LLM_MODEL），無法進行 RAG 評分。請先到 Streamlit 的 Secrets 設定。")
+        return False
     qvecs = None
     if mode == "vector":
         qvecs = load_query_vectors()
@@ -624,23 +648,31 @@ def run_scoring(tickers, mode="basic"):
             if mode == "vector" and not top:
                 reason = f"沒有段落達到相似度門檻（{vec_threshold}）"
             base[(t, dim)] = (sc_, reason, best, sim)
-            if use_llm and token and top and (llm_ungated or hit):
+            if top:  # 只要檢索到段落就交給 LLM 判斷，不受關鍵詞命中與否限制
                 jobs[(t, dim)] = top
         bar.progress(0.5 * (i + 1) / len(tickers), text="檢索與規則評分中…")
 
-    # 階段 2：LLM 複核（多個請求同時送出）
-    llm_res = {}
-    if jobs:
-        with ThreadPoolExecutor(max_workers=llm_workers) as ex:
+    # 階段 2：LLM 複核（多個請求同時送出；失敗的項目最後再單獨補跑一次）
+    llm_res, llm_err = {}, {}
+
+    def _run(batch, workers, label):
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(llm_review, COMPANIES[t], dim, top, endpoint, token, model): (t, dim)
-                    for (t, dim), top in jobs.items()}
+                    for (t, dim), top in batch.items()}
             for n, f in enumerate(as_completed(futs), 1):
-                llm_res[futs[f]] = f.result()
-                bar.progress(0.5 + 0.5 * n / len(jobs), text=f"LLM 複核 {n}/{len(jobs)}")
+                llm_res[futs[f]], llm_err[futs[f]] = f.result()
+                bar.progress(0.5 + 0.5 * n / len(batch), text=f"{label} {n}/{len(batch)}")
+
+    if jobs:
+        _run(jobs, llm_workers, "LLM 複核")
+        retry = {k: v for k, v in jobs.items()
+                 if llm_res.get(k) is None and not re.match(r"HTTP (400|401|403|404)", llm_err.get(k, ""))}
+        if retry:
+            _run(retry, 1, "補跑失敗項目")
     bar.progress(1.0, text="完成")
 
     # 階段 3：整理結果
-    rows, evidence = [], []
+    rows, evidence, llm_failed, fail_reasons = [], [], 0, {}
     for t in tickers:
         row = {"代碼": t, "公司": COMPANIES[t], "年度": year}
         for dim in RUBRIC:
@@ -648,11 +680,21 @@ def run_scoring(tickers, mode="basic"):
             r = llm_res.get((t, dim))
             if r:
                 sc_, reason = r
+            elif (t, dim) in jobs:  # 有送出但 LLM 沒有成功回應
+                err = llm_err.get((t, dim), "") or "原因不明"
+                reason = f"⚠️ LLM 未回應（{err}），暫用關鍵詞分數｜" + reason
+                llm_failed += 1
+                fail_reasons[err[:30]] = fail_reasons.get(err[:30], 0) + 1
             row[dim] = sc_
             evidence.append({"公司": COMPANIES[t], "構面": dim, "分數": sc_, "說明": reason,
                              "最高相似度": round(sim, 3) if sim is not None else None, "原文佐證": best[:300]})
         row["總分(平均)"] = round(float(np.mean([row[d] for d in RUBRIC])), 2)
         rows.append(row)
+    if llm_failed:
+        summary = "、".join(f"{k} ×{v}" for k, v in fail_reasons.items())
+        hint = ("請檢查 Secrets 的 CUSTOM_API_TOKEN / API_ENDPOINT / LLM_MODEL 是否正確。" if "HTTP 40" in summary and "429" not in summary
+                else "常見原因是額度限流：請把「LLM 同時呼叫數」調成 1，等一分鐘後按「🔄 重新評分」。")
+        st.warning(f"有 {llm_failed} 個構面的 LLM 沒有回應（已自動重試），暫用關鍵詞分數。失敗原因：{summary}。{hint}")
     st.session_state["scores"] = pd.DataFrame(rows)
     st.session_state["evidence"] = pd.DataFrame(evidence)
     st.session_state["scored_mode"] = mode
@@ -704,8 +746,6 @@ def metrics(ret, cum):
 
 # ---------------- 側邊欄 ----------------
 st.sidebar.title("🌿 控制面板")
-picked = st.sidebar.multiselect("選擇金控", list(COMPANIES), default=list(COMPANIES)[:5],
-                                format_func=lambda t: f"{t} {COMPANIES[t]}")
 top_k = st.sidebar.slider("每構面檢索片段數 (top-k)", 3, 10, 5)
 chunk_size = st.sidebar.slider("Chunk 字數", 200, 1000, 500)
 overlap = st.sidebar.slider("Overlap 字數", 0, 200, 50)
@@ -725,49 +765,23 @@ if vector_mode:
     if not (secret("QDRANT_URL") and secret("QDRANT_API_KEY")):
         st.sidebar.warning("尚未在 Secrets 設定 QDRANT_URL / QDRANT_API_KEY")
 
-st.sidebar.subheader("🔑 LLM 複核（選用）")
-use_llm = st.sidebar.checkbox("啟用 LLM 依檢索證據複核評分", value=False)
-llm_ungated = st.sidebar.checkbox("LLM 不受關鍵詞限制（只要檢索到段落就交給 LLM 判斷）", value=True,
-                                  help="關閉時：只有關鍵詞命中的構面才會交給 LLM，沒命中直接 0 分。")
-llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 3,
-                                help="越大越快，但免費額度容易被限流（429）；被限流的項目會退回關鍵詞分數。")
-endpoint = st.sidebar.text_input("API Endpoint", secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions"))
-# 安全做法：Secrets 裡的 key 只在伺服器端使用，絕不預填到網頁欄位（否則按「眼睛」圖示就看得到）
+st.sidebar.subheader("🧠 LLM 複核")
+st.sidebar.caption("每個構面都會把檢索到的原文交給 LLM 判斷評分（完整 RAG 流程）。")
+llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 2,
+                                help="越大越快，但免費額度容易被限流（429）；該項目沒有回應時，會暫用關鍵詞分數並在說明欄標示。")
+# LLM 連線設定一律從 Secrets 讀取，不在網頁上顯示或讓訪客輸入
+endpoint = secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+model = secret("LLM_MODEL", "gpt-4o-mini")
 _SECRET_TOKEN = secret("CUSTOM_API_TOKEN")
-_ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，訪客要輸入密碼才能使用你的 key
-_user_token = st.sidebar.text_input("（選填）使用你自己的 API key", "", type="password")
+_ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，要輸入密碼才能使用你的 key（有設定才會出現輸入框）
 _allowed = bool(_SECRET_TOKEN)
 if _SECRET_TOKEN and _ACCESS_CODE:
     _allowed = st.sidebar.text_input("LLM 功能使用密碼", "", type="password") == _ACCESS_CODE
-token = _user_token or (_SECRET_TOKEN if _allowed else "")
-if token and not _user_token:
-    st.sidebar.caption("✅ 已使用網站管理者設定的 API key（不會顯示在網頁上）")
-model = st.sidebar.text_input("模型名稱", secret("LLM_MODEL", "gpt-4o-mini"))
-
-if st.sidebar.button("📋 列出此帳號可用的模型"):
-    try:
-        mr = requests.get(endpoint.replace("/chat/completions", "/models"), timeout=20,
-                          headers={"Authorization": f"Bearer {token}"})
-        mr.raise_for_status()
-        st.sidebar.code("\n".join(sorted(m["id"] for m in mr.json().get("data", []))))
-    except Exception as e:
-        st.sidebar.error(f"查詢失敗：{e}")
-
-if st.sidebar.button("🔌 測試 API 連線"):
-    try:
-        r = requests.post(endpoint, timeout=20,
-                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                          json={"model": model, "max_tokens": 5,
-                                "messages": [{"role": "user", "content": "回覆OK"}]})
-        if r.ok:
-            st.sidebar.success("連線成功")
-        else:
-            st.sidebar.error(f"失敗 {r.status_code}：{r.text[:200]}")
-    except Exception as e:
-        st.sidebar.error(f"無法連線：{e}")
-
-st.sidebar.checkbox("略過 SSL 憑證驗證（疑難排解用，預設不要勾）", key="skip_ssl")
-_NET["skip_ssl"] = bool(st.session_state.get("skip_ssl", False))
+token = _SECRET_TOKEN if _allowed else ""
+if not token:
+    st.sidebar.error("LLM 尚未設定，無法評分：請在 Secrets 設定 CUSTOM_API_TOKEN、API_ENDPOINT、LLM_MODEL"
+                     "（若有設使用密碼，請輸入密碼）。")
+_NET["skip_ssl"] = False
 
 st.session_state.setdefault("docs", {})
 
@@ -918,7 +932,7 @@ with t1:
 
 # ---------------- Tab2 ----------------
 with t2:
-    st.caption("評分只依據報告書原文：先語意檢索相關段落，再依揭露深度打分（可選 LLM 複核）；找不到證據即為 0 分。")
+    st.caption("RAG 評分流程：檢索相關段落 → LLM 只依檢索到的原文判斷並給分（0–5 分）；找不到證據即為 0 分。")
     if "scores" not in st.session_state and not st.session_state["docs"]:
         st.info("請先在步驟 1 搜尋並載入報告書。")
     else:
