@@ -583,6 +583,9 @@ def index_count(ticker, year):
 
 def run_scoring(tickers, mode="basic"):
     """mode='basic'：TF-IDF 檢索（需已載入報告書全文）；mode='vector'：Qdrant 向量檢索。成功回傳 True。"""
+    if not token:
+        st.error("尚未設定 LLM（CUSTOM_API_TOKEN / API_ENDPOINT / LLM_MODEL），無法進行 RAG 評分。請先到 Streamlit 的 Secrets 設定。")
+        return False
     qvecs = None
     if mode == "vector":
         qvecs = load_query_vectors()
@@ -624,7 +627,7 @@ def run_scoring(tickers, mode="basic"):
             if mode == "vector" and not top:
                 reason = f"沒有段落達到相似度門檻（{vec_threshold}）"
             base[(t, dim)] = (sc_, reason, best, sim)
-            if use_llm and token and top and (llm_ungated or hit):
+            if top:  # 只要檢索到段落就交給 LLM 判斷，不受關鍵詞命中與否限制
                 jobs[(t, dim)] = top
         bar.progress(0.5 * (i + 1) / len(tickers), text="檢索與規則評分中…")
 
@@ -640,7 +643,7 @@ def run_scoring(tickers, mode="basic"):
     bar.progress(1.0, text="完成")
 
     # 階段 3：整理結果
-    rows, evidence = [], []
+    rows, evidence, llm_failed = [], [], 0
     for t in tickers:
         row = {"代碼": t, "公司": COMPANIES[t], "年度": year}
         for dim in RUBRIC:
@@ -648,11 +651,17 @@ def run_scoring(tickers, mode="basic"):
             r = llm_res.get((t, dim))
             if r:
                 sc_, reason = r
+            elif (t, dim) in jobs:  # 有送出但 LLM 沒有成功回應
+                reason = "⚠️ LLM 未回應，暫用關鍵詞分數｜" + reason
+                llm_failed += 1
             row[dim] = sc_
             evidence.append({"公司": COMPANIES[t], "構面": dim, "分數": sc_, "說明": reason,
                              "最高相似度": round(sim, 3) if sim is not None else None, "原文佐證": best[:300]})
         row["總分(平均)"] = round(float(np.mean([row[d] for d in RUBRIC])), 2)
         rows.append(row)
+    if llm_failed:
+        st.warning(f"有 {llm_failed} 個構面的 LLM 沒有回應（可能被限流或連線失敗），已暫用關鍵詞分數，"
+                   "請到「原文佐證」查看標示 ⚠️ 的項目；可把「LLM 同時呼叫數」調低後按「重新評分」。")
     st.session_state["scores"] = pd.DataFrame(rows)
     st.session_state["evidence"] = pd.DataFrame(evidence)
     st.session_state["scored_mode"] = mode
@@ -723,12 +732,10 @@ if vector_mode:
     if not (secret("QDRANT_URL") and secret("QDRANT_API_KEY")):
         st.sidebar.warning("尚未在 Secrets 設定 QDRANT_URL / QDRANT_API_KEY")
 
-st.sidebar.subheader("🔑 LLM 複核（選用）")
-use_llm = st.sidebar.checkbox("啟用 LLM 依檢索證據複核評分", value=False)
-llm_ungated = st.sidebar.checkbox("LLM 不受關鍵詞限制（只要檢索到段落就交給 LLM 判斷）", value=True,
-                                  help="關閉時：只有關鍵詞命中的構面才會交給 LLM，沒命中直接 0 分。")
+st.sidebar.subheader("🧠 LLM 複核")
+st.sidebar.caption("每個構面都會把檢索到的原文交給 LLM 判斷評分（完整 RAG 流程）。")
 llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 3,
-                                help="越大越快，但免費額度容易被限流（429）；被限流的項目會退回關鍵詞分數。")
+                                help="越大越快，但免費額度容易被限流（429）；該項目沒有回應時，會暫用關鍵詞分數並在說明欄標示。")
 # LLM 連線設定一律從 Secrets 讀取，不在網頁上顯示或讓訪客輸入
 endpoint = secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions")
 model = secret("LLM_MODEL", "gpt-4o-mini")
@@ -738,8 +745,9 @@ _allowed = bool(_SECRET_TOKEN)
 if _SECRET_TOKEN and _ACCESS_CODE:
     _allowed = st.sidebar.text_input("LLM 功能使用密碼", "", type="password") == _ACCESS_CODE
 token = _SECRET_TOKEN if _allowed else ""
-if use_llm and not token:
-    st.sidebar.warning("LLM 複核尚未生效：請在 Secrets 設定 CUSTOM_API_TOKEN（若有設使用密碼，請輸入密碼）。")
+if not token:
+    st.sidebar.error("LLM 尚未設定，無法評分：請在 Secrets 設定 CUSTOM_API_TOKEN、API_ENDPOINT、LLM_MODEL"
+                     "（若有設使用密碼，請輸入密碼）。")
 _NET["skip_ssl"] = False
 
 st.session_state.setdefault("docs", {})
@@ -891,7 +899,7 @@ with t1:
 
 # ---------------- Tab2 ----------------
 with t2:
-    st.caption("評分只依據報告書原文：先語意檢索相關段落，再依揭露深度打分（可選 LLM 複核）；找不到證據即為 0 分。")
+    st.caption("RAG 評分流程：檢索相關段落 → LLM 只依檢索到的原文判斷並給分（0–5 分）；找不到證據即為 0 分。")
     if "scores" not in st.session_state and not st.session_state["docs"]:
         st.info("請先在步驟 1 搜尋並載入報告書。")
     else:
