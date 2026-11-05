@@ -1,4 +1,4 @@
-import json, os, re, unicodedata
+import hashlib, json, os, re, unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -172,6 +172,13 @@ def rule_score(top_chunks, keywords):
         snippet = ("…" if a else "") + best[a:m.start()] + "【" + m.group() + "】" + best[m.end():b] + ("…" if b < len(best) else "")
     return round(score, 1), hit, page_label + snippet
 
+@st.cache_resource
+def _llm_cache():
+    return {}  # (公司, 構面, 模型, 檢索原文的雜湊) -> (分數, 理由)；同樣的原文不會重複呼叫 LLM
+
+def _llm_key(t, dim, top):
+    return (COMPANIES[t], dim, model, hashlib.md5("\n".join(top).encode("utf-8")).hexdigest())
+
 def make_tfidf(chunks):
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), preprocessor=_strip_punct)
     return vec, vec.fit_transform(chunks)
@@ -210,12 +217,18 @@ def llm_review(name, dim, evidence, endpoint, token, model):
             last = f"連線錯誤 {type(e).__name__}"
             time.sleep(2 * (attempt + 1))
             continue
-        if r.status_code == 429:  # 被限流：優先依伺服器建議的等待秒數，沒有就逐次加倍
-            last = "HTTP 429 被限流"
+        if r.status_code == 429:  # 被限流
+            m = re.search(r"\((TPM|TPD|RPM|RPD)\)", r.text or "")
+            kind = m.group(1) if m else ""
             try:
                 wait = float(r.headers.get("retry-after", ""))
             except ValueError:
                 wait = 4 * (2 ** attempt)
+            if kind in ("TPD", "RPD"):  # 每日額度用完，重試沒有意義
+                return None, f"HTTP 429：今日額度已用完（{kind}）"
+            if wait > 60:  # 要等太久，不在這裡空等
+                return None, f"HTTP 429：需等待約 {int(wait)} 秒（{kind or '額度'}）"
+            last = "HTTP 429 被限流" + (f"（{kind}）" if kind else "")
             time.sleep(min(wait, 30) + random.random())
             continue
         if r.status_code >= 500:
@@ -229,7 +242,7 @@ def llm_review(name, dim, evidence, endpoint, token, model):
             j = json.loads(re.search(r"\{.*\}", txt, re.S).group())
             pages = [str(p) for p in (j.get("pages") or []) if str(p).isdigit()]
             reason = str(j.get("reason", "")) + (f"（依據 PDF 第 {', '.join(pages)} 頁）" if pages else "")
-            return (max(0.0, min(5.0, float(j["score"]))), reason), ""
+            return (max(0.0, min(5.0, float(j["score"]))), reason, pages), ""
         except Exception:
             last = "回傳格式無法解析"
     return None, last
@@ -647,13 +660,23 @@ def run_scoring(tickers, mode="basic"):
             reason = f"命中關鍵詞：{', '.join(hit) or '無'}"
             if mode == "vector" and not top:
                 reason = f"沒有段落達到相似度門檻（{vec_threshold}）"
-            base[(t, dim)] = (sc_, reason, best, sim)
+            base[(t, dim)] = (sc_, reason, best, sim, top)
             if top:  # 只要檢索到段落就交給 LLM 判斷，不受關鍵詞命中與否限制
                 jobs[(t, dim)] = top
         bar.progress(0.5 * (i + 1) / len(tickers), text="檢索與規則評分中…")
 
     # 階段 2：LLM 複核（多個請求同時送出；失敗的項目最後再單獨補跑一次）
     llm_res, llm_err = {}, {}
+    lcache = _llm_cache()
+    cached = 0
+    pending = {}
+    for k, top in jobs.items():
+        ck = _llm_key(k[0], k[1], top)
+        if ck in lcache:  # 先前已成功評過的相同原文：直接沿用，不消耗額度
+            llm_res[k], llm_err[k] = lcache[ck], ""
+            cached += 1
+        else:
+            pending[k] = top
 
     def _run(batch, workers, label):
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -663,12 +686,16 @@ def run_scoring(tickers, mode="basic"):
                 llm_res[futs[f]], llm_err[futs[f]] = f.result()
                 bar.progress(0.5 + 0.5 * n / len(batch), text=f"{label} {n}/{len(batch)}")
 
-    if jobs:
-        _run(jobs, llm_workers, "LLM 複核")
-        retry = {k: v for k, v in jobs.items()
-                 if llm_res.get(k) is None and not re.match(r"HTTP (400|401|403|404)", llm_err.get(k, ""))}
+    if pending:
+        _run(pending, llm_workers, "LLM 複核")
+        retry = {k: v for k, v in pending.items()
+                 if llm_res.get(k) is None
+                 and not re.match(r"HTTP (400|401|403|404)|HTTP 429：", llm_err.get(k, ""))}
         if retry:
             _run(retry, 1, "補跑失敗項目")
+        for k, top in pending.items():
+            if llm_res.get(k) is not None:
+                lcache[_llm_key(k[0], k[1], top)] = llm_res[k]
     bar.progress(1.0, text="完成")
 
     # 階段 3：整理結果
@@ -676,25 +703,44 @@ def run_scoring(tickers, mode="basic"):
     for t in tickers:
         row = {"代碼": t, "公司": COMPANIES[t], "年度": year}
         for dim in RUBRIC:
-            sc_, reason, best, sim = base[(t, dim)]
+            sc_, reason, best, sim, top = base[(t, dim)]
             r = llm_res.get((t, dim))
+            shown, kind = best[:300], ("關鍵詞命中" if best else "無")
             if r:
-                sc_, reason = r
+                sc_, reason, *rest = r
+                pages = rest[0] if rest else []
+                cited = next((c for p in pages for c in top if c.startswith(f"[p{p}]")), None)
+                if cited:  # LLM 有標示頁碼：顯示它實際引用的那一段原文
+                    shown = f"（PDF 第 {_PAGE_TAG.match(cited).group(1)} 頁）" + _PAGE_TAG.sub("", cited)[:300]
+                    kind = "LLM 引用"
+                elif sc_ == 0:
+                    kind = "LLM 判定證據不足（右側僅為關鍵詞命中片段，供參考）" if best else "無"
+                else:
+                    kind = "關鍵詞命中（LLM 未標示頁碼）"
             elif (t, dim) in jobs:  # 有送出但 LLM 沒有成功回應
                 err = llm_err.get((t, dim), "") or "原因不明"
                 reason = f"⚠️ LLM 未回應（{err}），暫用關鍵詞分數｜" + reason
                 llm_failed += 1
                 fail_reasons[err[:30]] = fail_reasons.get(err[:30], 0) + 1
+                kind = "關鍵詞命中（LLM 未回應）" if best else "無"
             row[dim] = sc_
             evidence.append({"公司": COMPANIES[t], "構面": dim, "分數": sc_, "說明": reason,
-                             "最高相似度": round(sim, 3) if sim is not None else None, "原文佐證": best[:300]})
+                             "最高相似度": round(sim, 3) if sim is not None else None,
+                             "佐證類型": kind, "原文佐證": shown})
         row["總分(平均)"] = round(float(np.mean([row[d] for d in RUBRIC])), 2)
         rows.append(row)
     if llm_failed:
         summary = "、".join(f"{k} ×{v}" for k, v in fail_reasons.items())
-        hint = ("請檢查 Secrets 的 CUSTOM_API_TOKEN / API_ENDPOINT / LLM_MODEL 是否正確。" if "HTTP 40" in summary and "429" not in summary
-                else "常見原因是額度限流：請把「LLM 同時呼叫數」調成 1，等一分鐘後按「🔄 重新評分」。")
+        if "額度已用完" in summary or "需等待" in summary:
+            hint = ("這是 Groq 額度用完，不是程式錯誤：已成功的項目會保留、重新評分時不會再消耗額度。"
+                    "請等額度恢復後按「🔄 重新評分」，或改用較小的模型、調低檢索片段數 (top-k) 以減少 token 用量。")
+        elif re.search(r"HTTP 40[0134]：", summary):
+            hint = "請檢查 Secrets 的 CUSTOM_API_TOKEN / API_ENDPOINT / LLM_MODEL 是否正確。"
+        else:
+            hint = "常見原因是額度限流：請把「LLM 同時呼叫數」調成 1，等一分鐘後按「🔄 重新評分」（已成功的項目不會重跑）。"
         st.warning(f"有 {llm_failed} 個構面的 LLM 沒有回應（已自動重試），暫用關鍵詞分數。失敗原因：{summary}。{hint}")
+    if cached:
+        st.caption(f"ℹ️ 其中 {cached} 個構面沿用先前成功的 LLM 結果（原文相同，未消耗額度）。")
     st.session_state["scores"] = pd.DataFrame(rows)
     st.session_state["evidence"] = pd.DataFrame(evidence)
     st.session_state["scored_mode"] = mode
@@ -985,7 +1031,8 @@ with t4:
         d1, d2 = st.columns(2)
         start = d1.date_input("起始日", datetime(2022, 1, 1))
         end = d2.date_input("結束日", datetime.now())
-        st.warning("注意：用『最新』報告書分數回測過去績效存在前視偏誤(look-ahead bias)，結果僅供概念展示，不可視為可實際獲利的策略。")
+        st.warning("注意：回測使用的是同一組評分，並套用到整段期間；若報告書公布日期晚於起始日，就會有前視偏誤"
+                   "(look-ahead bias)。持股只有已評分的公司，樣本很少，結果僅供概念展示，不可視為可實際獲利的策略。")
         if st.button("執行回測", type="primary"):
             sc = st.session_state["scores"].set_index("代碼")["總分(平均)"]
             tickers = list(sc.index)
@@ -1000,10 +1047,24 @@ with t4:
                 cum = pd.DataFrame({"碳揭露評分加權": (1 + r_c).cumprod(), "等權重": (1 + r_e).cumprod()})
                 mc, me = metrics(r_c, cum.iloc[:, 0]), metrics(r_e, cum.iloc[:, 1])
                 names = ["CAGR %", "年化波動 %", "Sharpe", "最大回撤 %", "95% 日VaR %"]
+                wt = pd.DataFrame({"公司": [COMPANIES.get(t, t) for t in w_c.index],
+                                   "總分(滿分5分)": sc.reindex(w_c.index).values,
+                                   "評分加權的權重 %": (w_c * 100).round(1).values,
+                                   "等權重的權重 %": (w_e * 100).round(1).values})
+                st.markdown("**持股權重**（兩組權重越接近，兩條績效線就越重疊）")
+                st.dataframe(wt, use_container_width=True, hide_index=True)
+                st.markdown("**績效指標**")
                 st.dataframe(pd.DataFrame({"評分加權": mc, "等權重": me}, index=names).round(2), use_container_width=True)
-                st.plotly_chart(px.line(cum), use_container_width=True)
+                st.plotly_chart(px.line(cum, title="累積淨值（起始 = 1）", labels={"value": "累積淨值", "variable": ""}),
+                                use_container_width=True)
                 dd = (cum - cum.cummax()) / cum.cummax() * 100
-                st.plotly_chart(px.area(dd, labels={"value": "回撤 %"}), use_container_width=True)
+                fig_dd = go.Figure()  # 不用 px.area：它預設把兩組數列「疊加」，會讓回撤看起來變成兩倍
+                for col, color in zip(dd.columns, ["#1f77b4", "#ff7f0e"]):
+                    fig_dd.add_trace(go.Scatter(x=dd.index, y=dd[col], name=col, mode="lines", fill="tozeroy",
+                                                line=dict(color=color, width=1.5), opacity=0.7))
+                fig_dd.update_layout(title="水下回撤圖（與前高相比的跌幅 %）", yaxis_title="回撤 %", xaxis_title="日期",
+                                     legend_title_text="")
+                st.plotly_chart(fig_dd, use_container_width=True)
             except Exception as e:
                 st.error(f"回測失敗：{e}")
 
