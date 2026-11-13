@@ -751,10 +751,13 @@ def run_scoring(tickers, mode="basic"):
 def get_prices(tickers, start, end):
     """優先用 yfinance(還原權息價)；失敗或空值時改用 FinMind 日收盤價。"""
     try:
-        df = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)["Close"]
+        # yfinance 的 end 不含當天，所以 +1 天，才會包含你選的結束日
+        df = yf.download(tickers, start=start, end=pd.Timestamp(end) + pd.Timedelta(days=1),
+                         progress=False, auto_adjust=True)["Close"]
         if isinstance(df, pd.Series):
             df = df.to_frame(tickers[0])
         if not df.dropna(how="all").empty:
+            df.index = pd.to_datetime(df.index).tz_localize(None).normalize()  # 日期格式統一，方便和基準指數對齊
             return df, "yfinance"
     except Exception:
         pass
@@ -771,6 +774,36 @@ def get_prices(tickers, start, end):
             raise ValueError(f"FinMind 查無 {t} 的股價")
         cols[t] = d.set_index(pd.to_datetime(d["date"]))["close"]
     return pd.DataFrame(cols), "FinMind(未還原權息)"
+
+BENCHMARKS = {
+    "不加入基準指數": None,
+    "元大MSCI金融 ETF（0055.TW，金融類股代理）": ("0055.TW", "元大MSCI金融ETF"),
+    "加權指數 TAIEX（^TWII）": ("^TWII", "加權指數"),
+    "自訂 Yahoo 代碼（例如金融保險類指數）": "custom",
+}
+
+def get_benchmark(symbol, start, end):
+    """用和投資組合相同的起訖日期取得基準指數收盤價（end 不含當天，所以 +1 天）。"""
+    df = yf.download(symbol, start=start, end=pd.Timestamp(end) + pd.Timedelta(days=1),
+                     progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError(f"Yahoo 查無「{symbol}」在這段期間的資料，請確認代碼是否正確")
+    close = df["Close"] if "Close" in df else df
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna()
+    if close.empty:
+        raise ValueError(f"Yahoo 查無「{symbol}」在這段期間的資料，請確認代碼是否正確")
+    close.index = pd.to_datetime(close.index).tz_localize(None).normalize()
+    return close
+
+def align_with_benchmark(r_c, r_e, bench):
+    """把兩個投資組合與基準指數對齊到「三者都有資料的交易日」。回傳 (r_c, r_e, 指數報酬, 指數原始價格)。"""
+    br = bench.pct_change().dropna()
+    common = r_c.index.intersection(br.index)
+    if len(common) < 5:
+        raise ValueError("投資組合與基準指數幾乎沒有重疊的交易日，無法比較")
+    return r_c.loc[common], r_e.loc[common], br.loc[common], bench.loc[common]
 
 def ranked(df):
     """依總分由高到低排序，加上『排名』欄（從 1 開始，同分並列同名次）。"""
@@ -1031,6 +1064,14 @@ with t4:
         d1, d2 = st.columns(2)
         start = d1.date_input("起始日", datetime(2022, 1, 1))
         end = d2.date_input("結束日", datetime.now())
+        b_choice = st.selectbox("比較基準（金融類股指數）", list(BENCHMARKS), index=1,
+                                help="基準指數會用和上面相同的起訖日期，並對齊到相同的交易日。")
+        b_symbol, b_label = None, None
+        if BENCHMARKS[b_choice] == "custom":
+            b_symbol = st.text_input("Yahoo 代碼", "", help="輸入 Yahoo Finance 上的代碼，例如 ^TWII").strip() or None
+            b_label = b_symbol
+        elif BENCHMARKS[b_choice]:
+            b_symbol, b_label = BENCHMARKS[b_choice]
         st.warning("注意：回測使用的是同一組評分，並套用到整段期間；若報告書公布日期晚於起始日，就會有前視偏誤"
                    "(look-ahead bias)。持股只有已評分的公司，樣本很少，結果僅供概念展示，不可視為可實際獲利的策略。")
         if st.button("執行回測", type="primary"):
@@ -1044,8 +1085,21 @@ with t4:
                 w_c = w_c / w_c.sum()
                 w_e = pd.Series(1 / len(rets.columns), index=rets.columns)
                 r_c, r_e = (rets * w_c).sum(axis=1), (rets * w_e).sum(axis=1)
+                bench, bench_raw, br = None, None, None
+                if b_symbol:
+                    try:
+                        bench = get_benchmark(b_symbol, start, end)
+                        r_c, r_e, br, bench_raw = align_with_benchmark(r_c, r_e, bench)
+                        bench_raw.name = b_label
+                    except Exception as e:
+                        bench = None
+                        st.warning(f"基準指數未加入：{e}")
+                st.caption(f"已對齊的交易日：{r_c.index.min():%Y-%m-%d} ～ {r_c.index.max():%Y-%m-%d}，"
+                           f"共 {len(r_c)} 天（你選的區間：{start} ～ {end}；非交易日不會有資料）")
                 cum = pd.DataFrame({"碳揭露評分加權": (1 + r_c).cumprod(), "等權重": (1 + r_e).cumprod()})
-                mc, me = metrics(r_c, cum.iloc[:, 0]), metrics(r_e, cum.iloc[:, 1])
+                if bench is not None:
+                    cum[b_label] = (1 + br).cumprod()
+                mc, me = metrics(r_c, cum["碳揭露評分加權"]), metrics(r_e, cum["等權重"])
                 names = ["CAGR %", "年化波動 %", "Sharpe", "最大回撤 %", "95% 日VaR %"]
                 wt = pd.DataFrame({"公司": [COMPANIES.get(t, t) for t in w_c.index],
                                    "總分(滿分5分)": sc.reindex(w_c.index).values,
@@ -1054,12 +1108,21 @@ with t4:
                 st.markdown("**持股權重**（兩組權重越接近，兩條績效線就越重疊）")
                 st.dataframe(wt, use_container_width=True, hide_index=True)
                 st.markdown("**績效指標**")
-                st.dataframe(pd.DataFrame({"評分加權": mc, "等權重": me}, index=names).round(2), use_container_width=True)
+                perf = {"評分加權": mc, "等權重": me}
+                if bench is not None:
+                    perf[b_label] = metrics(br, cum[b_label])
+                st.dataframe(pd.DataFrame(perf, index=names).round(2), use_container_width=True)
+                if bench is not None:
+                    st.caption("提醒：加權指數是價格指數（不含股利），個股與 ETF 使用還原權息價（含股利），報酬比較會有些微偏差。")
                 st.plotly_chart(px.line(cum, title="累積淨值（起始 = 1）", labels={"value": "累積淨值", "variable": ""}),
                                 use_container_width=True)
+                if bench is not None:
+                    st.plotly_chart(px.line(bench_raw, title=f"{b_label} 走勢（原始價格／點位，與回測同一期間）",
+                                            labels={"value": "價格／點位", "index": "日期", "variable": ""}),
+                                    use_container_width=True)
                 dd = (cum - cum.cummax()) / cum.cummax() * 100
                 fig_dd = go.Figure()  # 不用 px.area：它預設把兩組數列「疊加」，會讓回撤看起來變成兩倍
-                for col, color in zip(dd.columns, ["#1f77b4", "#ff7f0e"]):
+                for col, color in zip(dd.columns, ["#1f77b4", "#ff7f0e", "#2ca02c"]):
                     fig_dd.add_trace(go.Scatter(x=dd.index, y=dd[col], name=col, mode="lines", fill="tozeroy",
                                                 line=dict(color=color, width=1.5), opacity=0.7))
                 fig_dd.update_layout(title="水下回撤圖（與前高相比的跌幅 %）", yaxis_title="回撤 %", xaxis_title="日期",
