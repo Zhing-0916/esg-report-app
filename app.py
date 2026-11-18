@@ -202,13 +202,15 @@ def llm_review(name, dim, evidence, endpoint, token, model):
               + "\n---\n".join(evidence))
     import random
     import time
+    payload = {"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]}
+    if LLM_REASONING_EFFORT and "gpt-oss" in str(model).lower():  # 只有 gpt-oss 系列支援這個參數
+        payload["reasoning_effort"] = LLM_REASONING_EFFORT
     last = "未知錯誤"
     for attempt in range(4):
         try:
             r = requests.post(endpoint, timeout=60,
                               headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                              json={"model": model, "temperature": 0,
-                                    "messages": [{"role": "user", "content": prompt}]})
+                              json=payload)
         except requests.exceptions.Timeout:
             last = "連線逾時"
             time.sleep(2 * (attempt + 1))
@@ -234,6 +236,10 @@ def llm_review(name, dim, evidence, endpoint, token, model):
         if r.status_code >= 500:
             last = f"HTTP {r.status_code} 伺服器錯誤"
             time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code == 400 and "reasoning_effort" in payload and "reasoning" in (r.text or "").lower():
+            payload.pop("reasoning_effort")  # 這個模型不接受思考強度參數：拿掉後重送
+            last = "模型不支援 reasoning_effort"
             continue
         if r.status_code >= 400:  # 金鑰、模型名稱、網址錯誤等：重試沒有用，直接回報
             return None, f"HTTP {r.status_code}：{r.text[:80]}"
@@ -775,12 +781,8 @@ def get_prices(tickers, start, end):
         cols[t] = d.set_index(pd.to_datetime(d["date"]))["close"]
     return pd.DataFrame(cols), "FinMind(未還原權息)"
 
-BENCHMARKS = {
-    "不加入基準指數": None,
-    "元大MSCI金融 ETF（0055.TW，金融類股代理）": ("0055.TW", "元大MSCI金融ETF"),
-    "加權指數 TAIEX（^TWII）": ("^TWII", "加權指數"),
-    "自訂 Yahoo 代碼（例如金融保險類指數）": "custom",
-}
+BENCHMARK_SYMBOL = "^TFNI"  # 金融保險類指數（yfinance）
+BENCHMARK_LABEL = "金融保險類指數(^TFNI)"
 
 def get_benchmark(symbol, start, end):
     """用和投資組合相同的起訖日期取得基準指數收盤價（end 不含當天，所以 +1 天）。"""
@@ -851,6 +853,7 @@ llm_workers = st.sidebar.slider("LLM 同時呼叫數", 1, 6, 2,
 # LLM 連線設定一律從 Secrets 讀取，不在網頁上顯示或讓訪客輸入
 endpoint = secret("API_ENDPOINT", "https://api.openai.com/v1/chat/completions")
 model = secret("LLM_MODEL", "gpt-4o-mini")
+LLM_REASONING_EFFORT = secret("LLM_REASONING_EFFORT", "low")  # gpt-oss 系列的思考強度：low / medium / high
 _SECRET_TOKEN = secret("CUSTOM_API_TOKEN")
 _ACCESS_CODE = secret("LLM_ACCESS_CODE")  # 選用：設了之後，要輸入密碼才能使用你的 key（有設定才會出現輸入框）
 _allowed = bool(_SECRET_TOKEN)
@@ -1064,14 +1067,8 @@ with t4:
         d1, d2 = st.columns(2)
         start = d1.date_input("起始日", datetime(2022, 1, 1))
         end = d2.date_input("結束日", datetime.now())
-        b_choice = st.selectbox("比較基準（金融類股指數）", list(BENCHMARKS), index=1,
-                                help="基準指數會用和上面相同的起訖日期，並對齊到相同的交易日。")
-        b_symbol, b_label = None, None
-        if BENCHMARKS[b_choice] == "custom":
-            b_symbol = st.text_input("Yahoo 代碼", "", help="輸入 Yahoo Finance 上的代碼，例如 ^TWII").strip() or None
-            b_label = b_symbol
-        elif BENCHMARKS[b_choice]:
-            b_symbol, b_label = BENCHMARKS[b_choice]
+        b_symbol, b_label = BENCHMARK_SYMBOL, BENCHMARK_LABEL  # 基準指數固定使用 yfinance 的 ^TFNI
+        st.caption(f"比較基準固定為：{b_label}，取得區間與上面的起訖日期相同，並對齊到相同的交易日。")
         st.warning("注意：回測使用的是同一組評分，並套用到整段期間；若報告書公布日期晚於起始日，就會有前視偏誤"
                    "(look-ahead bias)。持股只有已評分的公司，樣本很少，結果僅供概念展示，不可視為可實際獲利的策略。")
         if st.button("執行回測", type="primary"):
@@ -1113,7 +1110,7 @@ with t4:
                     perf[b_label] = metrics(br, cum[b_label])
                 st.dataframe(pd.DataFrame(perf, index=names).round(2), use_container_width=True)
                 if bench is not None:
-                    st.caption("提醒：加權指數是價格指數（不含股利），個股與 ETF 使用還原權息價（含股利），報酬比較會有些微偏差。")
+                    st.caption("提醒：金融保險類指數是價格指數（不含股利），個股使用還原權息價（含股利），報酬比較會有些微偏差。")
                 st.plotly_chart(px.line(cum, title="累積淨值（起始 = 1）", labels={"value": "累積淨值", "variable": ""}),
                                 use_container_width=True)
                 if bench is not None:
