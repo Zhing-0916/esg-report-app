@@ -807,6 +807,82 @@ def align_with_benchmark(r_c, r_e, bench):
         raise ValueError("投資組合與基準指數幾乎沒有重疊的交易日，無法比較")
     return r_c.loc[common], r_e.loc[common], br.loc[common], bench.loc[common]
 
+# ---------------- 已評分結果資料庫（之後載入不需要再呼叫 LLM） ----------------
+DB_COLS = ["年度", "代碼", "公司", "構面", "分數", "說明", "佐證類型", "原文佐證", "最高相似度", "檢索模式", "模型"]
+_NAME2CODE = {v: k for k, v in COMPANIES.items()}
+
+def _clean_db(df):
+    """整理成資料庫格式；只保留構面正確、分數有效、而且不是『LLM 失敗(⚠️)』的列。"""
+    df = df.copy()
+    for c in DB_COLS + ["代碼", "公司"]:
+        if c not in df.columns:
+            df[c] = ""
+    df["代碼"] = [(_norm_code(c) if str(c).strip() else _NAME2CODE.get(str(n).strip(), ""))
+                for c, n in zip(df["代碼"], df["公司"])]
+    df["年度"] = df["年度"].astype(str).str.extract(r"(\d{4})")[0]
+    df["分數"] = pd.to_numeric(df["分數"], errors="coerce")
+    ok = (df["代碼"].isin(COMPANIES) & df["年度"].notna() & df["構面"].isin(RUBRIC) & df["分數"].notna()
+          & ~df["說明"].astype(str).str.contains("⚠️"))
+    df = df[ok].copy()
+    df["公司"] = df["代碼"].map(COMPANIES)
+    return df[DB_COLS].drop_duplicates(["年度", "代碼", "構面"], keep="last").reset_index(drop=True)
+
+def load_scores_db():
+    p = os.path.join(BASE_DIR, "scores_db.csv")
+    if not os.path.exists(p):
+        return pd.DataFrame(columns=DB_COLS)
+    try:
+        return _clean_db(pd.read_csv(p, dtype=str, encoding="utf-8-sig").fillna(""))
+    except Exception:
+        return pd.DataFrame(columns=DB_COLS)
+
+def db_complete(db):
+    """六個構面都齊全的 (年度, 代碼)。"""
+    if db.empty:
+        return pd.DataFrame(columns=["年度", "代碼"])
+    g = db.groupby(["年度", "代碼"])["構面"].nunique().reset_index()
+    return g[g["構面"] == len(RUBRIC)][["年度", "代碼"]]
+
+def scores_from_db(db, year, tickers):
+    """從資料庫還原成評分表與原文佐證表（格式和即時評分的結果相同）。"""
+    sub = db[(db["年度"] == str(year)) & db["代碼"].isin(tickers)]
+    piv = sub.pivot(index="代碼", columns="構面", values="分數").reindex(columns=list(RUBRIC))
+    piv = piv.reindex([t for t in tickers if t in piv.index])
+    scores = pd.DataFrame({"代碼": list(piv.index), "公司": [COMPANIES[t] for t in piv.index], "年度": str(year)})
+    for d in RUBRIC:
+        scores[d] = piv[d].values
+    scores["總分(平均)"] = piv.mean(axis=1).round(2).values
+    ev = sub.copy()
+    ev["_o"] = ev["代碼"].map({t: i for i, t in enumerate(tickers)})
+    ev["_d"] = ev["構面"].map({d: i for i, d in enumerate(RUBRIC)})
+    ev = ev.sort_values(["_o", "_d"])
+    ev["最高相似度"] = pd.to_numeric(ev["最高相似度"], errors="coerce")
+    return scores, ev[["公司", "構面", "分數", "說明", "最高相似度", "佐證類型", "原文佐證"]].reset_index(drop=True)
+
+def scores_to_db_rows(evidence, year, mode):
+    """把這次的評分結果轉成資料庫格式。回傳 (可存入的列, 因 LLM 未成功而排除的筆數)。"""
+    ev = evidence.copy()
+    ev["年度"] = str(year)
+    ev["代碼"] = ev["公司"].map(_NAME2CODE)
+    ev["檢索模式"] = {"vector": "向量檢索", "basic": "TF-IDF"}.get(mode, mode)
+    ev["模型"] = model
+    out = _clean_db(ev)
+    return out, len(ev) - len(out)
+
+def merge_scores_db(new_rows):
+    merged = pd.concat([load_scores_db(), new_rows], ignore_index=True)
+    return (merged.drop_duplicates(["年度", "代碼", "構面"], keep="last")
+            .sort_values(["年度", "代碼"]).reset_index(drop=True))
+
+def import_evidence_csv(raw, year):
+    """匯入先前從『原文佐證』表格下載的 CSV。回傳 (可用的列, 原始筆數)。"""
+    import io
+    df = pd.read_csv(io.BytesIO(raw), dtype=str, encoding="utf-8-sig").fillna("")
+    df["年度"] = str(year)
+    df["檢索模式"] = "匯入"
+    df["模型"] = ""
+    return _clean_db(df), len(df)
+
 def ranked(df):
     """依總分由高到低排序，加上『排名』欄（從 1 開始，同分並列同名次）。"""
     d = df.sort_values("總分(平均)", ascending=False).reset_index(drop=True)
@@ -872,6 +948,51 @@ t1, t2, t3, t4 = st.tabs(["📂 1 取得報告書", "🤖 2 RAG 評分", "📊 3
 
 # ---------------- Tab1 ----------------
 with t1:
+    st.subheader("🗃️ 已評分結果資料庫（不消耗 LLM 額度）")
+    db = load_scores_db()
+    done = db_complete(db)
+    if done.empty:
+        st.info("目前還沒有可用的已評分資料庫（scores_db.csv）。評分完成後，到「步驟 2」下載 scores_db.csv 並上傳到 GitHub；"
+                "或用下方「匯入」把先前下載的原文佐證 CSV 轉成資料庫。")
+    else:
+        dy = st.selectbox("年度（已評分）", sorted(done["年度"].unique(), reverse=True), key="db_year")
+        cands = done[done["年度"] == dy]["代碼"].tolist()
+        dpicks = st.multiselect("選擇公司", cands, default=cands, format_func=lambda x: f"{x} {COMPANIES[x]}",
+                                key=f"db_picks_{dy}")
+        if st.button("📦 載入已評分結果（不呼叫 LLM）", type="primary") and dpicks:
+            sc_db, ev_db = scores_from_db(db, dy, dpicks)
+            st.session_state.update({"scores": sc_db, "evidence": ev_db, "scored_mode": "db",
+                                     "scored_tickers": dpicks, "lib_year": dy})
+            st.success(f"已載入 {len(dpicks)} 家 {dy} 年的評分結果（未呼叫 LLM）。請到「步驟 2」「步驟 3」「步驟 4」查看。")
+    with st.expander("📥 匯入先前下載的原文佐證 CSV（建立或更新資料庫）"):
+        st.caption("檔名需包含年度，例如「2022報告書原文佐證.csv」。含 ⚠️（LLM 未成功）的列不會收錄；"
+                   "某家公司六個構面不齊全時，該家不會出現在上面的載入選單。")
+        ups_db = st.file_uploader("上傳 CSV（可一次選多個年度）", type="csv", accept_multiple_files=True, key="db_import")
+        if ups_db:
+            parts, report = [], []
+            for f in ups_db:
+                m = re.search(r"(20\d{2})", f.name)
+                if not m:
+                    report.append({"檔案": f.name, "年度": "?", "原始筆數": "", "可收錄": 0, "備註": "檔名找不到年度，已略過"})
+                    continue
+                try:
+                    rows_, n_ = import_evidence_csv(f.getvalue(), m.group(1))
+                    parts.append(rows_)
+                    report.append({"檔案": f.name, "年度": m.group(1), "原始筆數": n_, "可收錄": len(rows_),
+                                   "備註": "" if len(rows_) == n_ else f"排除 {n_ - len(rows_)} 筆（⚠️ 或格式不符）"})
+                except Exception as e:
+                    report.append({"檔案": f.name, "年度": m.group(1), "原始筆數": "", "可收錄": 0,
+                                   "備註": f"讀取失敗：{type(e).__name__}"})
+            st.dataframe(pd.DataFrame(report), use_container_width=True, hide_index=True)
+            if parts:
+                merged_imp = (pd.concat([load_scores_db()] + parts, ignore_index=True)
+                              .drop_duplicates(["年度", "代碼", "構面"], keep="last")
+                              .sort_values(["年度", "代碼"]).reset_index(drop=True))
+                comp = db_complete(merged_imp)
+                st.caption(f"合併後：共 {len(merged_imp)} 筆；六構面齊全的公司年度有 {len(comp)} 組。")
+                st.download_button("⬇️ 下載 scores_db.csv", merged_imp.to_csv(index=False).encode("utf-8-sig"),
+                                   "scores_db.csv", key="dl_import_db")
+    st.divider()
     st.subheader("📚 報告書資料庫（優先使用）")
     lib = load_library()
     if lib.empty:
@@ -1019,8 +1140,11 @@ with t2:
         st.info("請先在步驟 1 搜尋並載入報告書。")
     else:
         _mode = st.session_state.get("scored_mode", "basic")
-        st.caption("目前評分使用的檢索模式：" + ("向量檢索（Qdrant）" if _mode == "vector" else "基礎（TF-IDF）"))
-        if st.button("🔄 重新評分（調整參數後使用）"):
+        st.caption("目前評分使用的檢索模式：" + {"vector": "向量檢索（Qdrant）",
+                                                  "db": "已評分結果資料庫（未呼叫 LLM、不消耗額度）"}.get(_mode, "基礎（TF-IDF）"))
+        if _mode == "db":
+            st.info("目前顯示的是已評分資料庫的結果，不需要、也不會重新評分。若要重新評分，請到步驟 1 從「報告書資料庫」載入。")
+        elif st.button("🔄 重新評分（調整參數後使用）"):
             if _mode == "vector":
                 run_scoring(st.session_state.get("scored_tickers", []), mode="vector")
             else:
@@ -1030,6 +1154,15 @@ with t2:
             st.dataframe(ranked(st.session_state["scores"]), use_container_width=True, hide_index=True)
             with st.expander("🔍 原文佐證（分數欄滿分為 5 分）"):
                 st.dataframe(st.session_state["evidence"], use_container_width=True, hide_index=True)
+            if _mode != "db":
+                rows_db, n_skip = scores_to_db_rows(st.session_state["evidence"], st.session_state.get("lib_year", ""), _mode)
+                if not rows_db.empty:
+                    merged_db = merge_scores_db(rows_db)
+                    st.download_button("⬇️ 下載更新後的 scores_db.csv（存入已評分資料庫，之後不用再呼叫 LLM）",
+                                       merged_db.to_csv(index=False).encode("utf-8-sig"), "scores_db.csv", key="dl_scores_db")
+                    st.caption(f"本次可存入 {len(rows_db)} 筆"
+                               + (f"；有 {n_skip} 筆因 LLM 未成功（⚠️）不收錄，補評成功後再存入。" if n_skip else "。")
+                               + " 下載後請上傳到 GitHub，覆蓋舊的 scores_db.csv。")
 
 # ---------------- Tab3 ----------------
 with t3:
