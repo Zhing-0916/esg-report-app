@@ -875,13 +875,30 @@ def merge_scores_db(new_rows):
             .sort_values(["年度", "代碼"]).reset_index(drop=True))
 
 def import_evidence_csv(raw, year):
-    """匯入先前從『原文佐證』表格下載的 CSV。回傳 (可用的列, 原始筆數)。"""
+    """匯入先前下載的 CSV，支援兩種格式：
+    1) 原文佐證表（有『構面』『分數』欄，每個構面一列）；
+    2) 排名表／評分表（每家公司一列，六個構面各一欄；沒有原文佐證）。
+    回傳 (可用的列, 原始筆數)。"""
     import io
     df = pd.read_csv(io.BytesIO(raw), dtype=str, encoding="utf-8-sig").fillna("")
-    df["年度"] = str(year)
-    df["檢索模式"] = "匯入"
-    df["模型"] = ""
-    return _clean_db(df), len(df)
+    df.columns = [c.strip() for c in df.columns]
+    if "構面" in df.columns and "分數" in df.columns:
+        n = len(df)
+        df["年度"] = str(year)
+        df["檢索模式"] = "匯入"
+        df["模型"] = ""
+    elif all(d in df.columns for d in RUBRIC) and ("代碼" in df.columns or "公司" in df.columns):
+        n = len(df) * len(RUBRIC)  # 每家公司 × 六個構面
+        recs = []
+        for _, r in df.iterrows():
+            for d in RUBRIC:
+                recs.append({"年度": str(year), "代碼": r.get("代碼", ""), "公司": r.get("公司", ""), "構面": d,
+                             "分數": r[d], "說明": "匯入自排名表（沒有 LLM 理由與原文佐證）", "佐證類型": "無",
+                             "原文佐證": "", "最高相似度": "", "檢索模式": "匯入(排名表)", "模型": ""})
+        df = pd.DataFrame(recs)
+    else:
+        raise ValueError("欄位不符：需要『構面、分數』欄（原文佐證表），或六個構面欄（排名表）")
+    return _clean_db(df), n
 
 def ranked(df):
     """依總分由高到低排序，加上『排名』欄（從 1 開始，同分並列同名次）。"""
@@ -965,7 +982,8 @@ with t1:
                                      "scored_tickers": dpicks, "lib_year": dy})
             st.success(f"已載入 {len(dpicks)} 家 {dy} 年的評分結果（未呼叫 LLM）。請到「步驟 2」「步驟 3」「步驟 4」查看。")
     with st.expander("📥 匯入先前下載的原文佐證 CSV（建立或更新資料庫）"):
-        st.caption("檔名需包含年度，例如「2022報告書原文佐證.csv」。含 ⚠️（LLM 未成功）的列不會收錄；"
+        st.caption("檔名需包含年度，例如「2022報告書原文佐證.csv」或「2022排名.csv」。支援兩種檔案：原文佐證表（含說明與佐證），"
+                   "或排名表（只有分數，匯入後沒有原文佐證）。含 ⚠️（LLM 未成功）的列不會收錄；"
                    "某家公司六個構面不齊全時，該家不會出現在上面的載入選單。")
         ups_db = st.file_uploader("上傳 CSV（可一次選多個年度）", type="csv", accept_multiple_files=True, key="db_import")
         if ups_db:
@@ -982,7 +1000,7 @@ with t1:
                                    "備註": "" if len(rows_) == n_ else f"排除 {n_ - len(rows_)} 筆（⚠️ 或格式不符）"})
                 except Exception as e:
                     report.append({"檔案": f.name, "年度": m.group(1), "原始筆數": "", "可收錄": 0,
-                                   "備註": f"讀取失敗：{type(e).__name__}"})
+                                   "備註": f"讀取失敗：{str(e)[:60] or type(e).__name__}"})
             st.dataframe(pd.DataFrame(report), use_container_width=True, hide_index=True)
             if parts:
                 merged_imp = (pd.concat([load_scores_db()] + parts, ignore_index=True)
