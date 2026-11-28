@@ -8,3 +8,4 @@ pypdf
 scikit-learn
 ddgs
 certifi
+qdrant-client
